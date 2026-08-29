@@ -414,9 +414,15 @@ class RLM:
                     # ``answer["content"]`` and setting ``answer["ready"] = True``.
                     # Each environment surfaces that on ``REPLResult.final_answer``.
                     final_answer = None
+                    final_answer_set = False
                     for block in iteration.code_blocks:
-                        if getattr(block.result, "final_answer", None) is not None:
+                        if getattr(
+                            block.result,
+                            "has_final_answer",
+                            getattr(block.result, "final_answer", None) is not None,
+                        ):
                             final_answer = block.result.final_answer
+                            final_answer_set = True
                             break
                     iteration.final_answer = final_answer
 
@@ -431,7 +437,7 @@ class RLM:
                     # Verbose output for this iteration
                     self.verbose.print_iteration(iteration, i + 1)
 
-                    if final_answer is not None:
+                    if final_answer_set:
                         time_end = time.perf_counter()
                         usage = lm_handler.get_usage_summary()
                         self.verbose.print_final_answer(final_answer)

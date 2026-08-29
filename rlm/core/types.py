@@ -120,7 +120,7 @@ class RLMChatCompletion:
 
     root_model: str
     prompt: str | dict[str, Any]
-    response: str
+    response: Any
     usage_summary: UsageSummary
     execution_time: float
     metadata: dict | None = (
@@ -164,7 +164,8 @@ class REPLResult:
     locals: dict
     execution_time: float
     llm_calls: list["RLMChatCompletion"]
-    final_answer: str | None = None
+    final_answer: Any | None = None
+    has_final_answer: bool = False
 
     def __init__(
         self,
@@ -173,7 +174,8 @@ class REPLResult:
         locals: dict,
         execution_time: float = None,
         rlm_calls: list["RLMChatCompletion"] = None,
-        final_answer: str | None = None,
+        final_answer: Any | None = None,
+        has_final_answer: bool | None = None,
     ):
         self.stdout = stdout
         self.stderr = stderr
@@ -181,6 +183,9 @@ class REPLResult:
         self.execution_time = execution_time
         self.rlm_calls = rlm_calls or []
         self.final_answer = final_answer
+        self.has_final_answer = (
+            final_answer is not None if has_final_answer is None else has_final_answer
+        )
 
     def __str__(self):
         return f"REPLResult(stdout={self.stdout}, stderr={self.stderr}, locals={self.locals}, execution_time={self.execution_time}, rlm_calls={len(self.rlm_calls)})"
@@ -193,6 +198,7 @@ class REPLResult:
             "execution_time": self.execution_time,
             "rlm_calls": [call.to_dict() for call in self.rlm_calls],
             "final_answer": self.final_answer,
+            "has_final_answer": self.has_final_answer,
         }
 
 
@@ -210,7 +216,7 @@ class RLMIteration:
     prompt: str | dict[str, Any]
     response: str
     code_blocks: list[CodeBlock]
-    final_answer: str | None = None
+    final_answer: Any | None = None
     iteration_time: float | None = None
 
     def to_dict(self):

@@ -99,6 +99,19 @@ The default `local` environment `LocalREPL` runs in the same process as the RLM 
 #### IPython (*requires `pip install 'rlms[ipython]'`*)
 `IPythonREPL` runs cells inside a real IPython session — either in-process (default) or in a separate `ipykernel` subprocess. Subprocess mode adds hard `cell_timeout` enforcement and full namespace isolation from the RLM host. See the [IPythonREPL docs](https://alexzhang13.github.io/rlm/environments/ipython) for details.
 
+Subprocess cells also expose an async, handle-based API. Children start at `spawn`, can run concurrently across cells, and return structured status, text, error, usage, timing, and truncation fields. `final` preserves the first JSON value and only surfaces it when the cell succeeds.
+
+```python
+handles = [
+    await rlm.spawn("Summarize this shard", context=shard)
+    for shard in shards
+]
+results = await rlm.gather(handles)
+await rlm.final({"summaries": [result["text"] for result in results]})
+```
+
+Applications with their own model runtime can reuse `AsyncRLMHost` and `RLMClient` from `rlm.environments.ipython_async`; the host accepts a backend-neutral child callback and owns authentication, handle lifetime, atomic gather, final-value gating, and cancellation.
+
 #### Docker <img src="https://github.com/docker.png" alt="Docker" height="20" style="vertical-align: middle;"/> (*requires [Docker installed](https://docs.docker.com/desktop/setup/install/)*)
 We also support a Docker-based environment called `DockerREPL` that launches the REPL environment as a Docker image. By default, we use the `python:3.11-slim` image, but the user can specify custom images as well. The container runs fully isolated from the host; a lightweight host-side proxy bridges LM access back into the container.
 

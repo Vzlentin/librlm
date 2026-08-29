@@ -52,9 +52,24 @@ from rlm.environments.base_env import (
     extract_tool_value,
     validate_custom_tools,
 )
+from rlm.environments.ipython_async import (
+    AsyncRLMHost,
+    ChildRequest,
+    ChildRunner,
+    IPythonOutputStream,
+)
 from rlm.environments.local_repl import _AnswerDict
 
 KernelMode = Literal["in_process", "subprocess"]
+
+
+class _AsyncCompletionResult(dict[str, Any]):
+    """JSON-compatible child result retaining its parent-only completion."""
+
+    def __init__(self, completion: RLMChatCompletion, **values: Any) -> None:
+        super().__init__(values)
+        self.completion = completion
+
 
 # IPython populates user_ns with these. We strip them before returning locals
 # so REPLResult.locals stays clean and comparable to LocalREPL.
@@ -307,6 +322,8 @@ class _SubcallBroker:
 def _build_kernel_bootstrap(
     lm_address: tuple[str, int] | None,
     subcall_address: tuple[str, int] | None,
+    async_address: tuple[str, int],
+    async_auth_token: str,
     depth: int,
     subcall_timeout: float | None,
 ) -> str:
@@ -316,6 +333,7 @@ def _build_kernel_bootstrap(
         import json as _rlm_json
         import socket as _rlm_socket
         import struct as _rlm_struct
+        from rlm.environments.ipython_async import RLMClient as _RLMAsyncClient
 
         _RLM_LM_ADDRESS = {list(lm_address) if lm_address else None!r}
         _RLM_SUBCALL_ADDRESS = {list(subcall_address) if subcall_address else None!r}
@@ -434,10 +452,17 @@ def _build_kernel_bootstrap(
                         pass
 
         answer = _RLMAnswerDict()
+        _RLM_ASYNC_CLIENT = _RLMAsyncClient(
+            {list(async_address)!r},
+            {async_auth_token!r},
+            timeout={subcall_timeout if subcall_timeout is not None else 310.0!r},
+        )
+        rlm = _RLM_ASYNC_CLIENT
+        _RLM_ASYNC_CLIENT._install_ipython_hook(get_ipython())
 
         def SHOW_VARS():
             ns = get_ipython().user_ns
-            skip = {{"In", "Out", "exit", "quit", "get_ipython", "answer"}}
+            skip = {{"In", "Out", "exit", "quit", "get_ipython", "answer", "rlm"}}
             available = {{
                 k: type(v).__name__
                 for k, v in ns.items()
@@ -515,6 +540,14 @@ class IPythonREPL(NonIsolatedEnv):
             disables the timeout, which matches in-process behavior where
             subcalls block indefinitely.
         max_concurrent_subcalls: Cap on concurrent ``rlm_query_batched`` calls.
+        working_dir: Directory used by the IPython session. The default is an
+            owned temporary directory, preserving the historical behavior.
+        output_callback: Optional subprocess-mode callback receiving normalized
+            text and clear events as they arrive.
+        async_child_runner: Optional backend-neutral callback for ``rlm.spawn``.
+            It receives a child request and cancellation event. When omitted,
+            ``subcall_fn`` is adapted for compatibility, but arbitrary legacy
+            callbacks cannot be interrupted while they are running.
     """
 
     def __init__(
@@ -532,6 +565,9 @@ class IPythonREPL(NonIsolatedEnv):
         startup_timeout: float = 60.0,
         subcall_timeout: float | None = None,
         max_concurrent_subcalls: int = 4,
+        working_dir: str | None = None,
+        output_callback: Callable[[dict[str, Any]], None] | None = None,
+        async_child_runner: ChildRunner | None = None,
         **kwargs,
     ):
         if kernel_mode not in ("in_process", "subprocess"):
@@ -566,6 +602,8 @@ class IPythonREPL(NonIsolatedEnv):
         self.cell_timeout = cell_timeout if cell_timeout and cell_timeout > 0 else None
         self.startup_timeout = startup_timeout
         self.subcall_timeout = subcall_timeout
+        self.output_callback = output_callback
+        self.async_child_runner = async_child_runner
 
         self.custom_tools = custom_tools or {}
         self.custom_sub_tools = (
@@ -574,7 +612,15 @@ class IPythonREPL(NonIsolatedEnv):
         validate_custom_tools(self.custom_tools)
 
         self.original_cwd = os.getcwd()
-        self.temp_dir = tempfile.mkdtemp(prefix=f"ipython_env_{uuid.uuid4()}_")
+        if working_dir is not None:
+            resolved_working_dir = os.path.abspath(working_dir)
+            if not os.path.isdir(resolved_working_dir):
+                raise ValueError(f"working_dir is not a directory: {working_dir!r}")
+            self.temp_dir = resolved_working_dir
+            self._owns_temp_dir = False
+        else:
+            self.temp_dir = tempfile.mkdtemp(prefix=f"ipython_env_{uuid.uuid4()}_")
+            self._owns_temp_dir = True
         # RLock lets ``add_context`` / ``add_history`` hold the lock while
         # invoking ``execute_code`` (which re-acquires it) so the
         # index→assign→count-increment sequence stays atomic across threads.
@@ -628,6 +674,7 @@ class IPythonREPL(NonIsolatedEnv):
         self._km: Any = None
         self._kc: Any = None
         self._broker: _SubcallBroker | None = None
+        self._async_host: AsyncRLMHost | None = None
 
         # If anything below fails after a kernel/broker has started, we must
         # tear them down explicitly — relying on ``__del__`` is timing-
@@ -733,13 +780,18 @@ class IPythonREPL(NonIsolatedEnv):
             max_concurrent=self.max_concurrent_subcalls,
         )
         self._broker.start()
+        self._async_host = AsyncRLMHost(
+            self.async_child_runner or self._run_async_child,
+            max_concurrent=self.max_concurrent_subcalls,
+        )
+        self._async_host.start()
 
         self._km = KernelManager(kernel_name="python3")
         # Force the kernel to run under the same Python as the parent process,
         # so it inherits the same installed packages (dill, custom imports,
         # etc.). Without this, jupyter_client uses whatever 'python' is on
         # PATH per the default kernelspec.
-        self._km.kernel_cmd = [
+        self._km.kernel_spec.argv = [
             sys.executable,
             "-m",
             "ipykernel_launcher",
@@ -755,6 +807,8 @@ class IPythonREPL(NonIsolatedEnv):
         bootstrap = _build_kernel_bootstrap(
             lm_address=self.lm_handler_address,
             subcall_address=self._broker.address,
+            async_address=self._async_host.address,
+            async_auth_token=self._async_host.auth_token,
             depth=self.depth,
             subcall_timeout=self.subcall_timeout,
         )
@@ -834,6 +888,31 @@ class IPythonREPL(NonIsolatedEnv):
     def _capture_answer(self, content: Any) -> None:
         """Called by ``_AnswerDict`` when the model sets ``answer["ready"] = True``."""
         self._last_final_answer = str(content)
+
+    def _run_async_child(self, request: ChildRequest, cancel: threading.Event) -> dict[str, Any]:
+        """Adapt the existing recursive callback to the structured async API."""
+        started = time.perf_counter()
+        if cancel.is_set():
+            raise RuntimeError("child cancelled before startup")
+        if self.subcall_fn is None:
+            raise RuntimeError("No subcall_fn configured; rlm.spawn unavailable")
+        prompt = (
+            request.task
+            if request.context is None
+            else f"{request.task}\n\n<context>\n{request.context}\n</context>"
+        )
+        completion = self._tracked_subcall(prompt, None)
+        if cancel.is_set():
+            raise RuntimeError("child cancelled")
+        return _AsyncCompletionResult(
+            completion,
+            status="error" if completion.error else "ok",
+            text=None if completion.error else completion.response,
+            error=completion.error,
+            usage=completion.usage_summary.to_dict(),
+            elapsed_ms=round((time.perf_counter() - started) * 1000),
+            truncated=False,
+        )
 
     @staticmethod
     def _disabled_input(*_args: Any, **_kwargs: Any) -> str:
@@ -1256,6 +1335,7 @@ class IPythonREPL(NonIsolatedEnv):
         broker drain.
         """
         assert self._kc is not None and self._broker is not None
+        assert self._async_host is not None
 
         with self._lock:
             return self._execute_in_kernel_locked(code, timeout, drain_broker)
@@ -1276,6 +1356,7 @@ class IPythonREPL(NonIsolatedEnv):
         cell_id = uuid.uuid4().hex if drain_broker else None
 
         if cell_id is not None:
+            self._async_host.begin_execution(cell_id)
             # Set the kernel-side ``_RLM_CURRENT_CELL`` via a separate
             # ``execute_interactive`` call rather than prepending to the
             # user's code — prepending would push cell magics
@@ -1283,46 +1364,50 @@ class IPythonREPL(NonIsolatedEnv):
             # and break them.
             try:
                 self._kc.execute_interactive(
-                    f"_RLM_CURRENT_CELL = {cell_id!r}",
+                    f"_RLM_CURRENT_CELL = {cell_id!r}; rlm = _RLM_ASYNC_CLIENT; rlm._set_execution({cell_id!r})",
                     timeout=self.startup_timeout,
                     output_hook=lambda _msg: None,
                     store_history=False,
                     stop_on_error=False,
                     allow_stdin=False,
                 )
-            except TimeoutError as e:
-                # Setter shouldn't time out under any sane condition; if
-                # it does, surface the failure rather than silently
-                # mis-attributing this cell's subcalls.
-                raise RuntimeError(f"Failed to set cell_id in kernel: {e}") from e
+            except Exception as error:
+                self._async_host.end_execution(cell_id, successful=False)
+                # Setter failures must not leave a live execution that later
+                # background work can use.
+                raise RuntimeError(f"Failed to set cell_id in kernel: {error}") from error
 
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         error_info: dict[str, Any] | None = None
 
+        def accept_output(event: dict[str, Any]) -> None:
+            if self.output_callback is not None:
+                self.output_callback(copy.deepcopy(event))
+            if event["type"] == "clear":
+                stdout_parts.clear()
+                stderr_parts.clear()
+                return
+            kind = event["kind"]
+            text = event["text"]
+            if kind == "stderr":
+                stderr_parts.append(text)
+            elif kind == "error":
+                stderr_parts.append("\n" + self._strip_ansi(text))
+            else:
+                stdout_parts.append(text)
+                if kind in ("result", "display") and not text.endswith("\n"):
+                    stdout_parts.append("\n")
+
+        output_stream = IPythonOutputStream(accept_output)
+
         def output_hook(msg: dict[str, Any]) -> None:
             nonlocal error_info
             msg_type = msg.get("header", {}).get("msg_type")
             content = msg.get("content", {})
-            if msg_type == "stream":
-                name = content.get("name")
-                text = content.get("text", "")
-                if name == "stderr":
-                    stderr_parts.append(text)
-                else:
-                    stdout_parts.append(text)
-            elif msg_type == "error":
+            if msg_type == "error":
                 error_info = content
-            elif msg_type == "execute_result":
-                data = content.get("data", {})
-                text = data.get("text/plain")
-                if text:
-                    stdout_parts.append(text + "\n")
-            elif msg_type == "display_data":
-                data = content.get("data", {})
-                text = data.get("text/plain")
-                if text:
-                    stdout_parts.append(text + "\n")
+            output_stream.feed(msg_type, content)
 
         timed_out = False
         try:
@@ -1343,17 +1428,10 @@ class IPythonREPL(NonIsolatedEnv):
             stderr_parts.append(
                 f"\nTimeoutError: cell execution exceeded {timeout}s and was interrupted"
             )
-
-        if error_info is not None and not timed_out:
-            ename = error_info.get("ename", "Error")
-            evalue = error_info.get("evalue", "")
-            traceback_lines = error_info.get("traceback") or []
-            # Strip ANSI escape codes from tracebacks for cleaner stderr
-            tb = "\n".join(self._strip_ansi(line) for line in traceback_lines)
-            if tb:
-                stderr_parts.append("\n" + tb)
-            else:
-                stderr_parts.append(f"\n{ename}: {evalue}")
+        except Exception:
+            if cell_id is not None:
+                self._async_host.end_execution(cell_id, successful=False)
+            raise
 
         # Drain broker state (rlm_query completions, answer-dict capture)
         # *for this cell only*. Stragglers from prior timed-out cells live
@@ -1361,9 +1439,21 @@ class IPythonREPL(NonIsolatedEnv):
         # than attributing them to this cell.
         if drain_broker:
             assert cell_id is not None
-            completions, final_answer = self._broker.drain(cell_id)
+            try:
+                completions, final_answer = self._broker.drain(cell_id)
+            finally:
+                async_summary = self._async_host.end_execution(
+                    cell_id, successful=not timed_out and error_info is None
+                )
+            for child_result in async_summary["gathered_results"]:
+                if isinstance(child_result, _AsyncCompletionResult):
+                    completions.append(child_result.completion)
+            has_final_answer = final_answer is not None or async_summary["has_final"]
+            if async_summary["has_final"]:
+                final_answer = async_summary["final_value"]
         else:
             completions, final_answer = [], None
+            has_final_answer = False
 
         return REPLResult(
             stdout="".join(stdout_parts),
@@ -1372,6 +1462,7 @@ class IPythonREPL(NonIsolatedEnv):
             execution_time=time.perf_counter() - start_time,
             rlm_calls=list(completions),
             final_answer=final_answer,
+            has_final_answer=has_final_answer,
         )
 
     @staticmethod
@@ -1468,6 +1559,12 @@ class IPythonREPL(NonIsolatedEnv):
                 except Exception:
                     pass
                 self._broker = None
+            if self._async_host is not None:
+                try:
+                    self._async_host.stop()
+                except Exception:
+                    pass
+                self._async_host = None
 
         if self._shell is not None:
             # IPython's ``InteractiveShell.__init__`` registers
@@ -1492,10 +1589,11 @@ class IPythonREPL(NonIsolatedEnv):
             sys.modules.pop(user_module.__name__, None)
             self._user_module = None
 
-        try:
-            shutil.rmtree(self.temp_dir)
-        except Exception:
-            pass
+        if self._owns_temp_dir:
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception:
+                pass
 
     def __enter__(self) -> IPythonREPL:
         return self

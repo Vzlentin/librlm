@@ -1033,3 +1033,120 @@ def test_setup_failure_runs_cleanup():
             kernel_mode="subprocess",
             context_payload={"bad": _Unserializable()},
         )
+
+
+# -----------------------------------------------------------------------------
+# Async RLM primitives (subprocess mode)
+# -----------------------------------------------------------------------------
+
+
+def test_async_spawn_gather_and_json_final():
+    fake = _FakeSubcall(["ALPHA", "BETA"])
+    with IPythonREPL(kernel_mode="subprocess", subcall_fn=fake) as repl:
+        result = repl.execute_code(
+            "hs = [await rlm.spawn('a', context='ctx'), await rlm.spawn('b')]\n"
+            "values = await rlm.gather(hs)\n"
+            "await rlm.final({'statuses': [v['status'] for v in values], "
+            "'texts': [v['text'] for v in values]})"
+        )
+    assert result.stderr == ""
+    assert result.final_answer == {"statuses": ["ok", "ok"], "texts": ["ALPHA", "BETA"]}
+    assert [call.response for call in result.rlm_calls] == ["ALPHA", "BETA"]
+    assert fake.calls[0][0] == "a\n\n<context>\nctx\n</context>"
+
+
+def test_async_handle_survives_successful_cell():
+    fake = _FakeSubcall(["CROSSCELL"])
+    with IPythonREPL(kernel_mode="subprocess", subcall_fn=fake) as repl:
+        first = repl.execute_code("h = await rlm.spawn('cross-cell')")
+        second = repl.execute_code(
+            "value = (await rlm.gather([h]))[0]\n"
+            "await rlm.final({'status': value['status'], 'text': value['text']})"
+        )
+    assert first.stderr == ""
+    assert second.final_answer == {"status": "ok", "text": "CROSSCELL"}
+
+
+def test_async_concurrent_gather_has_one_winner():
+    fake = _FakeSubcall(["DONE"])
+    code = """
+import asyncio
+h = await rlm.spawn("race")
+async def gather_once():
+    try:
+        value = await rlm.gather([h])
+        return {"status": "ok", "value": value}
+    except Exception as error:
+        return {"status": "error", "error": str(error)}
+a, b = await asyncio.gather(gather_once(), gather_once())
+await rlm.final({"attempts": [a, b]})
+"""
+    with IPythonREPL(kernel_mode="subprocess", subcall_fn=fake) as repl:
+        result = repl.execute_code(code)
+    statuses = sorted(item["status"] for item in result.final_answer["attempts"])
+    assert statuses == ["error", "ok"]
+
+
+def test_async_final_from_failed_cell_is_not_surfaced():
+    with IPythonREPL(kernel_mode="subprocess") as repl:
+        result = repl.execute_code("await rlm.final({'hidden': True})\nraise RuntimeError('boom')")
+    assert "RuntimeError" in result.stderr
+    assert result.final_answer is None
+    assert result.has_final_answer is False
+
+
+def test_async_null_final_preserves_presence():
+    with IPythonREPL(kernel_mode="subprocess") as repl:
+        result = repl.execute_code("await rlm.final(None)")
+    assert result.final_answer is None
+    assert result.has_final_answer is True
+
+
+def test_async_client_is_restored_between_cells():
+    with IPythonREPL(kernel_mode="subprocess") as repl:
+        repl.execute_code("rlm = 'overwritten'")
+        result = repl.execute_code("await rlm.final({'restored': True})")
+    assert result.stderr == ""
+    assert result.final_answer == {"restored": True}
+
+
+def test_async_child_runner_receives_cell_cancellation():
+    cancelled = threading.Event()
+
+    def runner(request, cancel):
+        assert cancel.wait(2)
+        cancelled.set()
+        raise RuntimeError("cancelled")
+
+    with IPythonREPL(
+        kernel_mode="subprocess",
+        async_child_runner=runner,
+        cell_timeout=0.2,
+    ) as repl:
+        result = repl.execute_code("h = await rlm.spawn('slow')\nawait rlm.gather([h])")
+    assert "TimeoutError" in result.stderr
+    assert cancelled.wait(1)
+
+
+def test_subprocess_working_dir_and_streaming_callback(tmp_path):
+    events: list[dict] = []
+    (tmp_path / "value.txt").write_text("from-cwd")
+    code = """
+from pathlib import Path
+from IPython.display import clear_output
+print(Path("value.txt").read_text())
+clear_output(wait=False)
+print("after-clear")
+"""
+    with IPythonREPL(
+        kernel_mode="subprocess",
+        working_dir=str(tmp_path),
+        output_callback=events.append,
+    ) as repl:
+        result = repl.execute_code(code)
+    assert result.stdout == "after-clear\n"
+    assert any(
+        event == {"type": "text", "kind": "stdout", "text": "after-clear\n"} for event in events
+    )
+    assert any(event["type"] == "clear" for event in events)
+    assert (tmp_path / "value.txt").read_text() == "from-cwd"
