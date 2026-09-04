@@ -1,7 +1,10 @@
 """Tests for core types."""
 
+import pytest
+
 from rlm.core.types import (
     CodeBlock,
+    FinalValue,
     ModelUsageSummary,
     QueryMetadata,
     REPLResult,
@@ -112,6 +115,52 @@ class TestREPLResult:
         assert "REPLResult" in s
         assert "stdout=test" in s
 
+    def test_final_presence_and_value_cannot_contradict(self):
+        absent = REPLResult(stdout="", stderr="", locals={}, final_answer=None)
+        explicit_null = REPLResult(stdout="", stderr="", locals={}, final=FinalValue.of(None))
+
+        assert absent.has_final_answer is False
+        assert explicit_null.has_final_answer is True
+        assert explicit_null.final_answer is None
+        with pytest.raises(AttributeError):
+            explicit_null.has_final_answer = False
+        with pytest.raises(AttributeError):
+            explicit_null.final_answer = "contradiction"
+        with pytest.raises(ValueError, match="absent final"):
+            FinalValue(False, "contradiction")
+
+    @pytest.mark.parametrize(
+        "final",
+        [FinalValue.absent(), FinalValue.of(None), FinalValue.of({"answer": 42})],
+    )
+    def test_final_wire_roundtrip_preserves_presence(self, final: FinalValue):
+        assert FinalValue.from_dict(final.to_dict()) == final
+        result = REPLResult(stdout="", stderr="", locals={}, final=final)
+        assert result.to_dict()["final"] == final.to_dict()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            (1, 2),
+            {1: "one"},
+            {"nested": (1, 2)},
+            {"nested": {1: "one"}},
+            float("nan"),
+            float("inf"),
+        ],
+    )
+    def test_final_rejects_noncanonical_json_shapes(self, value):
+        with pytest.raises(TypeError, match="canonical JSON"):
+            FinalValue.of(value)
+
+    def test_final_copies_its_canonical_value(self):
+        source = {"items": [1]}
+        final = FinalValue.of(source)
+        source["items"].append(2)
+        returned = final.value
+        returned["items"].append(3)
+        assert final.value == {"items": [1]}
+
 
 class TestCodeBlock:
     """Tests for CodeBlock."""
@@ -140,6 +189,19 @@ class TestRLMIteration:
             final_answer="42",
         )
         assert iteration.final_answer == "42"
+
+    def test_explicit_null_differs_from_absent_in_metadata(self):
+        absent = RLMIteration(prompt="test", response="", code_blocks=[])
+        explicit_null = RLMIteration(
+            prompt="test",
+            response="null",
+            code_blocks=[],
+            final=FinalValue.of(None),
+        )
+
+        assert absent.final_answer is None
+        assert explicit_null.final_answer is None
+        assert absent.to_dict()["final"] != explicit_null.to_dict()["final"]
 
     def test_to_dict(self):
         result = REPLResult(stdout="", stderr="", locals={})
@@ -188,6 +250,62 @@ class TestRLMChatCompletion:
         assert d["metadata"] == trajectory
         c2 = RLMChatCompletion.from_dict(d)
         assert c2.metadata == trajectory
+
+    @pytest.mark.parametrize(
+        "final",
+        [FinalValue.absent(), FinalValue.of(None), FinalValue.of({"answer": [42, None]})],
+    )
+    def test_structured_final_roundtrip_keeps_response_text_only(self, final: FinalValue):
+        usage = UsageSummary(model_usage_summaries={})
+        completion = RLMChatCompletion(
+            root_model="gpt-4",
+            prompt="hi",
+            response='{"answer": [42, null]}',
+            usage_summary=usage,
+            execution_time=1.0,
+            final=final,
+        )
+
+        restored = RLMChatCompletion.from_dict(completion.to_dict())
+
+        assert isinstance(restored.response, str)
+        assert restored.final == final
+
+    @pytest.mark.parametrize(
+        ("fields", "expected"),
+        [
+            ({}, FinalValue.absent()),
+            ({"has_final": False, "final_value": None}, FinalValue.absent()),
+            ({"has_final": True, "final_value": None}, FinalValue.of(None)),
+            (
+                {"has_final": True, "final_value": {"answer": 42}},
+                FinalValue.of({"answer": 42}),
+            ),
+        ],
+    )
+    def test_legacy_flat_final_metadata_is_preserved(self, fields, expected):
+        completion = RLMChatCompletion(
+            root_model="gpt-4",
+            prompt="hi",
+            response="hello",
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=1.0,
+        )
+        data = completion.to_dict()
+        data.pop("final")
+        data.update(fields)
+
+        assert RLMChatCompletion.from_dict(data).final == expected
+
+    def test_non_text_response_is_rejected(self):
+        with pytest.raises(TypeError, match="response must be a string"):
+            RLMChatCompletion(
+                root_model="gpt-4",
+                prompt="hi",
+                response={"not": "text"},
+                usage_summary=UsageSummary(model_usage_summaries={}),
+                execution_time=1.0,
+            )
 
 
 class TestQueryMetadata:

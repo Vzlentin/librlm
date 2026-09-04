@@ -1,8 +1,11 @@
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from rlm.environments.base_env import (
     RESERVED_TOOL_NAMES,
     BaseEnv,
+    CompletionFinalization,
+    SupportsCompaction,
     SupportsCustomTools,
     SupportsPersistence,
     ToolInfo,
@@ -27,19 +30,66 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "BaseEnv",
+    "CompletionFinalization",
     "IPythonREPL",
     "LocalREPL",
+    "EnvironmentCapabilities",
     "RESERVED_TOOL_NAMES",
+    "SupportsCompaction",
     "SupportsCustomTools",
     "SupportsPersistence",
     "ToolInfo",
     "extract_tool_value",
     "format_tools_for_prompt",
     "get_environment",
+    "get_environment_capabilities",
     "parse_custom_tools",
     "parse_tool_entry",
     "validate_custom_tools",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentCapabilities:
+    persistence: bool = False
+    custom_tools: bool = False
+    compaction: bool = False
+    recursive_subcalls: bool = False
+
+
+_ENVIRONMENT_CAPABILITIES = {
+    "local": EnvironmentCapabilities(
+        persistence=True,
+        custom_tools=True,
+        compaction=True,
+        recursive_subcalls=True,
+    ),
+    "ipython": EnvironmentCapabilities(
+        persistence=True,
+        custom_tools=True,
+        recursive_subcalls=True,
+    ),
+    "docker": EnvironmentCapabilities(
+        persistence=True,
+        custom_tools=True,
+        compaction=True,
+        recursive_subcalls=True,
+    ),
+    "daytona": EnvironmentCapabilities(custom_tools=True),
+    "modal": EnvironmentCapabilities(),
+    "prime": EnvironmentCapabilities(),
+    "e2b": EnvironmentCapabilities(),
+}
+
+
+def get_environment_capabilities(
+    environment: Literal["local", "ipython", "modal", "docker", "daytona", "prime", "e2b"],
+) -> EnvironmentCapabilities:
+    """Return the declared behavior supported by one environment adapter."""
+    try:
+        return _ENVIRONMENT_CAPABILITIES[environment]
+    except KeyError as error:
+        raise ValueError(f"Unknown environment: {environment}") from error
 
 
 def get_environment(

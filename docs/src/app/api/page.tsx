@@ -269,8 +269,9 @@ rlm = RLM(..., logger=logger)`} />
               rows={[
                 [<code key="1" className="text-sm font-semibold">response</code>, <code key="2" className="text-sm">str</code>, "Final answer from the RLM"],
                 [<code key="3" className="text-sm font-semibold">execution_time</code>, <code key="4" className="text-sm">float</code>, "Total execution time in seconds"],
-                [<code key="5" className="text-sm font-semibold">usage_summary</code>, <code key="6" className="text-sm">UsageSummary</code>, "Aggregated token usage across all LM calls"],
+                [<code key="5" className="text-sm font-semibold">usage_summary</code>, <code key="6" className="text-sm">UsageSummary</code>, "Aggregated token usage across root and child calls"],
                 [<code key="7" className="text-sm font-semibold">root_model</code>, <code key="8" className="text-sm">str</code>, "Model name used for root completion"],
+                [<code key="9" className="text-sm font-semibold">final</code>, <code key="10" className="text-sm">FinalValue</code>, "Presence-preserving structured JSON final, including explicit null"],
               ]}
             />
           </div>

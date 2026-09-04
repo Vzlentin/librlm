@@ -1,4 +1,13 @@
-// Types matching the RLM log format
+// Types matching the canonical RLM log format.
+
+export type JSONValue = string | number | boolean | null | JSONValue[] | { [key: string]: JSONValue };
+
+export interface FinalValue {
+  has_final: boolean;
+  final_value: JSONValue;
+}
+
+export const ABSENT_FINAL: FinalValue = { has_final: false, final_value: null };
 
 export interface RLMChatCompletion {
   prompt: string | Record<string, unknown>;
@@ -6,14 +15,16 @@ export interface RLMChatCompletion {
   prompt_tokens: number;
   completion_tokens: number;
   execution_time: number;
+  final: FinalValue;
 }
 
 export interface REPLResult {
   stdout: string;
   stderr: string;
   locals: Record<string, unknown>;
-  execution_time: number;
+  execution_time: number | null;
   rlm_calls: RLMChatCompletion[];
+  final: FinalValue;
 }
 
 export interface CodeBlock {
@@ -28,11 +39,11 @@ export interface RLMIteration {
   prompt: Array<{ role: string; content: string }>;
   response: string;
   code_blocks: CodeBlock[];
-  final_answer: string | [string, string] | null;
+  final: FinalValue;
   iteration_time: number | null;
 }
 
-// Metadata saved at the start of a log file about RLM configuration
+// Metadata saved at the start of a log file about RLM configuration.
 export interface RLMConfigMetadata {
   root_model: string | null;
   max_depth: number | null;
@@ -57,16 +68,14 @@ export interface LogMetadata {
   totalCodeBlocks: number;
   totalSubLMCalls: number;
   contextQuestion: string;
-  finalAnswer: string | null;
+  final: FinalValue;
   totalExecutionTime: number;
   hasErrors: boolean;
 }
 
-export function extractFinalAnswer(answer: string | [string, string] | null): string | null {
-  if (!answer) return null;
-  if (Array.isArray(answer)) {
-    return answer[1];
-  }
-  return answer;
+/** Render structured values as JSON while leaving string answers readable. */
+export function formatFinal(final: FinalValue): string | null {
+  if (!final.has_final) return null;
+  if (typeof final.final_value === 'string') return final.final_value;
+  return JSON.stringify(final.final_value, null, 2);
 }
-

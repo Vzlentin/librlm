@@ -17,35 +17,11 @@ from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_bat
 from rlm.core.types import REPLResult, RLMChatCompletion
 from rlm.environments.base_env import (
     RESERVED_TOOL_NAMES,
+    FinalAnswerDict,
     NonIsolatedEnv,
     extract_tool_value,
     validate_custom_tools,
 )
-
-
-class _AnswerDict(dict):
-    """REPL-visible dict where ``answer["ready"] = True`` signals completion.
-
-    Behaves exactly like ``dict`` for the model, but invokes ``on_ready`` the
-    first time ``ready`` flips truthy. The callback receives the current
-    ``content``, lets the env capture it (in-process attr, broker push, etc.),
-    and the next ``execute_code`` will surface it as ``REPLResult.final_answer``.
-    """
-
-    def __init__(self, on_ready=None):
-        super().__init__()
-        super().__setitem__("content", "")
-        super().__setitem__("ready", False)
-        self._on_ready = on_ready
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        if key == "ready" and value and self._on_ready is not None:
-            try:
-                self._on_ready(self.get("content", ""))
-            except Exception:
-                pass
-
 
 # =============================================================================
 # Safe Builtins
@@ -159,22 +135,20 @@ class LocalREPL(NonIsolatedEnv):
         depth: int = 1,
         subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
         custom_tools: dict[str, Any] | None = None,
-        custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
         max_concurrent_subcalls: int = 4,
-        **kwargs,
     ):
         super().__init__(
             persistent=persistent,
             depth=depth,
             max_concurrent_subcalls=max_concurrent_subcalls,
-            **kwargs,
         )
 
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
         self.original_cwd = os.getcwd()
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
+        self._cleaned_up = False
         self._lock = threading.Lock()
         self._context_count: int = 0
         self._history_count: int = 0
@@ -182,11 +156,6 @@ class LocalREPL(NonIsolatedEnv):
 
         # Custom tools: functions available in the REPL
         self.custom_tools = custom_tools or {}
-        # Sub-tools: inherited from custom_tools if not specified
-        self.custom_sub_tools = (
-            custom_sub_tools if custom_sub_tools is not None else self.custom_tools
-        )
-
         # Validate custom tools don't override reserved names
         validate_custom_tools(self.custom_tools)
 
@@ -229,7 +198,7 @@ class LocalREPL(NonIsolatedEnv):
         # The model marks completion via ``answer["ready"] = True``; the
         # custom dict captures the content as soon as that happens so we
         # don't have to probe the namespace after every cell.
-        self.locals["answer"] = _AnswerDict(on_ready=self._capture_answer)
+        self.locals["answer"] = FinalAnswerDict(on_ready=self._capture_answer)
 
         # Add custom tools to globals
         # Tools can be either plain values or (value, description) tuples
@@ -527,10 +496,10 @@ class LocalREPL(NonIsolatedEnv):
             elif name == "answer":
                 current = self.locals.get("answer")
                 # If the model rebound ``answer`` to a plain dict, the
-                # _AnswerDict callback never fired; capture content here if
+                # FinalAnswerDict callback never fired; capture content here if
                 # ``ready=True``, then re-wrap so the next cell signals.
-                if not isinstance(current, _AnswerDict):
-                    replacement = _AnswerDict(on_ready=self._capture_answer)
+                if not isinstance(current, FinalAnswerDict):
+                    replacement = FinalAnswerDict(on_ready=self._capture_answer)
                     if isinstance(current, dict):
                         for k, v in current.items():
                             dict.__setitem__(replacement, k, v)
@@ -590,15 +559,26 @@ class LocalREPL(NonIsolatedEnv):
         return False
 
     def cleanup(self):
-        """Clean up temp directory and reset state."""
+        """Clean up the temporary directory and reset state."""
+        if self._cleaned_up:
+            return
+
+        cleanup_error: BaseException | None = None
         try:
             shutil.rmtree(self.temp_dir)
-        except Exception:
+        except FileNotFoundError:
             pass
-        if hasattr(self, "globals"):
-            self.globals.clear()
-        if hasattr(self, "locals"):
-            self.locals.clear()
+        except BaseException as error:
+            cleanup_error = error
+        self.globals.clear()
+        self.locals.clear()
+
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+        self._cleaned_up = True
 
     def __del__(self):
-        self.cleanup()
+        try:
+            self.cleanup()
+        except BaseException:
+            pass

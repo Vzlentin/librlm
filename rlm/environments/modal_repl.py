@@ -179,26 +179,27 @@ def llm_query_batched(prompts, model=None):
 STATE_FILE = "/tmp/rlm_state.dill"
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "rb") as f:
-                return dill.load(f)
-        except:
-            pass
-    return {{}}
+    if not os.path.exists(STATE_FILE):
+        return {{}}
+    with open(STATE_FILE, "rb") as f:
+        return dill.load(f)
 
 def save_state(state):
     clean_state = {{}}
+    skipped = []
     for k, v in state.items():
         if k.startswith("_"):
             continue
         try:
             dill.dumps(v)
             clean_state[k] = v
-        except:
-            pass
-    with open(STATE_FILE, "wb") as f:
+        except Exception as error:
+            skipped.append((k, f"{{type(error).__name__}}: {{error}}"))
+    temporary_state = STATE_FILE + ".tmp"
+    with open(temporary_state, "wb") as f:
         dill.dump(clean_state, f)
+    os.replace(temporary_state, STATE_FILE)
+    return skipped
 
 def serialize_locals(state):
     result = {{}}
@@ -260,7 +261,8 @@ if "context_0" in _locals:
 if "history_0" in _locals:
     _locals["history"] = _locals["history_0"]
 
-save_state(_locals)
+for _name, _error in save_state(_locals):
+    stderr_buf.write(f"Warning: variable {{_name!r}} was not persisted: {{_error}}\\n")
 
 _ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
 _final = str(_ans.get("content", "")) if (_ans is not None and _ans.get("ready")) else None
@@ -297,13 +299,12 @@ class ModalREPL(IsolatedEnv):
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
-        **kwargs,
     ):
         if persistent:
             raise NotImplementedError(
                 "Persistent REPLs are currently not supported for environment: ModalREPL"
             )
-        super().__init__(persistent=persistent, depth=depth, **kwargs)
+        super().__init__(persistent=persistent, depth=depth)
 
         self.app_name = app_name
         self.timeout = timeout
@@ -491,18 +492,28 @@ class ModalREPL(IsolatedEnv):
 
     def cleanup(self):
         """Terminate the sandbox and stop polling."""
-        # Stop the poller thread
+        errors: list[BaseException] = []
         if self.poller_thread is not None:
             self.poller_stop.set()
-            self.poller_thread.join(timeout=2)
-            self.poller_thread = None
+            self.poller_thread.join(timeout=30)
+            if self.poller_thread.is_alive():
+                errors.append(RuntimeError("Modal broker poller did not stop"))
+            else:
+                self.poller_thread = None
 
         if self.sandbox is not None:
             try:
                 self.sandbox.terminate()
-            except Exception:
-                pass
-            self.sandbox = None
+            except BaseException as error:
+                errors.append(error)
+            else:
+                self.sandbox = None
+
+        if len(errors) == 1:
+            error = errors[0]
+            raise error.with_traceback(error.__traceback__)
+        if errors:
+            raise BaseExceptionGroup("Modal cleanup failed", errors)
 
     def __enter__(self):
         return self
@@ -512,4 +523,7 @@ class ModalREPL(IsolatedEnv):
         return False
 
     def __del__(self):
-        self.cleanup()
+        try:
+            self.cleanup()
+        except BaseException:
+            pass

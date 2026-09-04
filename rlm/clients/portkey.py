@@ -4,7 +4,7 @@ from typing import Any
 from portkey_ai import AsyncPortkey, Portkey
 from portkey_ai.api_resources.types.chat_complete_type import ChatCompletions
 
-from rlm.clients.base_lm import BaseLM
+from rlm.clients.base_lm import DEFAULT_TIMEOUT, BaseLM
 from rlm.core.types import ModelUsageSummary, UsageSummary
 
 
@@ -18,9 +18,13 @@ class PortkeyClient(BaseLM):
         api_key: str,
         model_name: str | None = None,
         base_url: str | None = "https://api.portkey.ai/v1",
-        **kwargs,
+        timeout: float = DEFAULT_TIMEOUT,
+        sampling_args: dict[str, Any] | None = None,
     ):
-        super().__init__(model_name=model_name, **kwargs)
+        super().__init__(model_name=model_name, timeout=timeout, sampling_args=sampling_args)
+        reserved = self.sampling_args.keys() & {"model", "messages"}
+        if reserved:
+            raise ValueError(f"Portkey sampling_args cannot override {sorted(reserved)}")
         self.client = Portkey(api_key=api_key, base_url=base_url, timeout=self.timeout)
         self.async_client = AsyncPortkey(api_key=api_key, base_url=base_url, timeout=self.timeout)
         self.model_name = model_name
@@ -29,7 +33,6 @@ class PortkeyClient(BaseLM):
         self.model_call_counts: dict[str, int] = defaultdict(int)
         self.model_input_tokens: dict[str, int] = defaultdict(int)
         self.model_output_tokens: dict[str, int] = defaultdict(int)
-        self.model_total_tokens: dict[str, int] = defaultdict(int)
 
     def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
         if isinstance(prompt, str):
@@ -46,11 +49,14 @@ class PortkeyClient(BaseLM):
         response = self.client.chat.completions.create(
             model=model,
             messages=messages,
+            **self.sampling_args,
         )
         self._track_cost(response, model)
         return response.choices[0].message.content
 
-    async def acompletion(self, prompt: str | dict[str, Any], model: str | None = None) -> str:
+    async def acompletion(
+        self, prompt: str | list[dict[str, Any]], model: str | None = None
+    ) -> str:
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, list) and all(isinstance(item, dict) for item in prompt):
@@ -62,7 +68,11 @@ class PortkeyClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Portkey client.")
 
-        response = await self.async_client.chat.completions.create(model=model, messages=messages)
+        response = await self.async_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            **self.sampling_args,
+        )
         self._track_cost(response, model)
         return response.choices[0].message.content
 
@@ -70,7 +80,6 @@ class PortkeyClient(BaseLM):
         self.model_call_counts[model] += 1
         self.model_input_tokens[model] += response.usage.prompt_tokens
         self.model_output_tokens[model] += response.usage.completion_tokens
-        self.model_total_tokens[model] += response.usage.total_tokens
 
         # Track last call for handler to read
         self.last_prompt_tokens = response.usage.prompt_tokens

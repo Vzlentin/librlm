@@ -26,7 +26,9 @@ def create_mock_lm(responses: list[str]) -> Mock:
             "mock": ModelUsageSummary(total_calls=1, total_input_tokens=100, total_output_tokens=50)
         }
     )
-    mock.get_last_usage.return_value = mock.get_usage_summary.return_value
+    mock.get_last_usage.return_value = mock.get_usage_summary.return_value.model_usage_summaries[
+        "mock"
+    ]
     return mock
 
 

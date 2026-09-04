@@ -31,7 +31,7 @@ class LMRequestHandler(StreamRequestHandler):
             if request.is_batched:
                 # Batched request: process multiple prompts concurrently
                 response = self._handle_batched(request, handler)
-            elif request.prompt:
+            elif request.prompt is not None:
                 # Single request: process one prompt
                 response = self._handle_single(request, handler)
             else:

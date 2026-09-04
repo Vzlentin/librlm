@@ -16,10 +16,10 @@ interface CodeBlockProps {
 
 export function CodeBlock({ block, index }: CodeBlockProps) {
   const [isOpen, setIsOpen] = useState(true);
-  const hasError = block.result?.stderr && block.result.stderr.length > 0;
-  const hasOutput = block.result?.stdout && block.result.stdout.length > 0;
-  const executionTime = block.result?.execution_time 
-    ? block.result.execution_time.toFixed(2) 
+  const hasError = block.result.stderr.length > 0;
+  const hasOutput = block.result.stdout.length > 0;
+  const executionTime = block.result.execution_time !== null
+    ? block.result.execution_time.toFixed(2)
     : null;
 
   return (
@@ -112,7 +112,7 @@ export function CodeBlock({ block, index }: CodeBlockProps) {
             )}
 
             {/* Locals */}
-            {block.result?.locals && Object.keys(block.result.locals).length > 0 && (
+            {Object.keys(block.result.locals).length > 0 && (
               <div className="border-t border-border bg-muted/50">
                 <div className="px-3 py-1.5 border-b border-border/50 flex items-center gap-2">
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
@@ -139,7 +139,7 @@ export function CodeBlock({ block, index }: CodeBlockProps) {
             )}
 
             {/* Sub-LM Calls */}
-            {block.result?.rlm_calls && block.result.rlm_calls.length > 0 && (
+            {block.result.rlm_calls.length > 0 && (
               <div className="border-t border-border bg-fuchsia-500/5 dark:bg-fuchsia-400/5">
                 <div className="px-3 py-1.5 border-b border-border/50 flex items-center gap-2">
                   <span className="text-[10px] uppercase tracking-wider text-fuchsia-600 dark:text-fuchsia-400 font-medium">

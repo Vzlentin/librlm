@@ -97,9 +97,9 @@ rlm = RLM(
 The default `local` environment `LocalREPL` runs in the same process as the RLM itself, with specified global and local namespaces for minimal security. Using this REPL is generally safe, but should not be used for production settings. It also shares the same virtual environment (e.g. Conda or uv) as the host process.
 
 #### IPython (*requires `pip install 'rlms[ipython]'`*)
-`IPythonREPL` runs cells inside a real IPython session — either in-process (default) or in a separate `ipykernel` subprocess. Subprocess mode adds hard `cell_timeout` enforcement and full namespace isolation from the RLM host. See the [IPythonREPL docs](https://alexzhang13.github.io/rlm/environments/ipython) for details.
+`IPythonREPL` runs cells inside a real IPython session, either in-process by default or in a separate `ipykernel` subprocess. Subprocess mode adds hard `cell_timeout` enforcement and full namespace isolation from the RLM host. In-process cells share cwd, stdout, stderr, and signals, so all in-process instances execute under one process-wide owner and recursive batches stay on the calling thread. Use subprocess mode for parallel cells. See the [IPythonREPL docs](https://alexzhang13.github.io/rlm/environments/ipython) for details.
 
-Subprocess cells also expose an async, handle-based API. Children start at `spawn`, can run concurrently across cells, and return structured status, text, error, usage, timing, and truncation fields. `final` preserves the first JSON value and only surfaces it when the cell succeeds.
+Subprocess cells also expose an async, handle-based API. Children start at `spawn`, can run concurrently across cells, and return structured status, text, error, usage, timing, and truncation fields. `max_concurrent_subcalls` limits running `subcall_fn` work across compatibility queries and async children without reducing live-handle capacity. `max_budget` is a postpaid limit: each child receives the latest observed remaining-budget snapshot, but concurrent calls do not reserve spend and may exceed the limit before the next usage check. `spawn` returns a handle immediately and queues child execution when every subcall slot is busy. `final` preserves the first JSON value and only surfaces it when the cell succeeds.
 
 ```python
 handles = [
@@ -110,12 +110,24 @@ results = await rlm.gather(handles)
 await rlm.final({"summaries": [result["text"] for result in results]})
 ```
 
-Applications with their own model runtime can reuse `AsyncRLMHost` and `RLMClient` from `rlm.environments.ipython_async`; the host accepts a backend-neutral child callback and owns authentication, handle lifetime, atomic gather, final-value gating, and cancellation.
+`gather` returns validated `ChildResult` objects. They support attribute access such as `result.text` and mapping access such as `result["text"]`.
+
+Each handle is delivered once. If a gather response or cleanup response is lost, retrying `gather` recovers the cached result without attributing usage again. After `gather` returns successfully, those handles are consumed and a later gather rejects them.
+
+A successful cell may leave handles for a later cell. Release handles that you will not gather so they stop consuming the live-handle limit. Release is idempotent and asks unfinished children to cancel.
+
+```python
+await rlm.release(unneeded_handles)
+```
+
+Applications with their own model runtime can reuse `ChildExecution`, `AsyncRLMHost`, and `RLMClient` from `rlm.environments.ipython_async`. `ChildExecution` owns child admission, cancellation, teardown, and settlement. `AsyncRLMHost` owns authenticated transport, handle lifetime, atomic gather, final-value gating, and result delivery. Standalone adapters return `ChildOutcome.external(...)` and may use any string-keyed canonical JSON object as the usage shape. A subprocess-only `async_child_runner` attached to `IPythonREPL` returns one `RLMChatCompletion`. The child module derives the wire result from that completion and settles its usage once, even when teardown fails. Use `host.execution(client, execution_id)` to bind host execution setup, client activation, and exit-time finalization in the required order.
+
+`query_runner` receives the query kind, one ordered prompt batch, the optional model, and a cancellation event, and returns one `QueryOutcome` per prompt. Import `QueryOutcome` from `rlm.environments.ipython_queries`. `IPythonREPL` routes recursive queries and spawned children through the same `ChildExecution` admission limit. Runners should stop promptly when cancellation is signaled. `ChildResult` validates status, text, error, usage, timing, and truncation before serialization. Host shutdown cancels queued work and waits for active child and query runners to exit.
 
 #### Docker <img src="https://github.com/docker.png" alt="Docker" height="20" style="vertical-align: middle;"/> (*requires [Docker installed](https://docs.docker.com/desktop/setup/install/)*)
 We also support a Docker-based environment called `DockerREPL` that launches the REPL environment as a Docker image. By default, we use the `python:3.11-slim` image, but the user can specify custom images as well. The container runs fully isolated from the host; a lightweight host-side proxy bridges LM access back into the container.
 
-`DockerREPL` supports the full feature set of the local environment: single LM calls (`llm_query` / `llm_query_batched`), recursive sub-RLM calls (`rlm_query` / `rlm_query_batched`, including parallel batched sub-calls bounded by `max_concurrent_subcalls`), `custom_tools` / `custom_sub_tools`, `persistent=True` multi-turn sessions (versioned `context_N` / `history_N` reused across `completion()` calls), and `compaction=True` auto-summarization of the running `history`. For isolated environments, custom tools should be passed as Python code strings or JSON-serializable values (host callables cannot cross the process boundary).
+`DockerREPL` supports the full feature set of the local environment: single LM calls (`llm_query` / `llm_query_batched`), recursive sub-RLM calls (`rlm_query` / `rlm_query_batched`, including parallel batched sub-calls bounded by `max_concurrent_subcalls`), `custom_tools`, `persistent=True` multi-turn sessions (versioned `context_N` / `history_N` reused across `completion()` calls), and `compaction=True` auto-summarization of the running `history`. Docker and Daytona custom tools must be Python code strings or JSON-serializable values because host callables cannot cross the process boundary. Modal, Prime, and E2B do not support custom tools.
 
 ### Isolated Environments
 We support several different REPL environments that run on separate, cloud-based machines. Whenever a recursive sub-call is made in these instances, it is requested from the host process.

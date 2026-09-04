@@ -10,7 +10,7 @@ import { TrajectoryPanel } from './TrajectoryPanel';
 import { ExecutionPanel } from './ExecutionPanel';
 import { IterationTimeline } from './IterationTimeline';
 import { ThemeToggle } from './ThemeToggle';
-import { RLMLogFile } from '@/lib/types';
+import { RLMLogFile, formatFinal } from '@/lib/types';
 
 interface LogViewerProps {
   logFile: RLMLogFile;
@@ -75,7 +75,7 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
               {metadata.hasErrors && (
                 <Badge variant="destructive" className="text-xs">Has Errors</Badge>
               )}
-              {metadata.finalAnswer && (
+              {metadata.final.has_final && (
                 <Badge className="bg-emerald-500 hover:bg-emerald-600 text-white text-xs">
                   Completed
                 </Badge>
@@ -106,7 +106,7 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
                     Final Answer
                   </p>
                   <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400 line-clamp-2">
-                    {metadata.finalAnswer || 'Not yet completed'}
+                    {formatFinal(metadata.final) ?? 'Not yet completed'}
                   </p>
                 </div>
               </div>
@@ -159,7 +159,6 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
               <TrajectoryPanel
                 iterations={iterations}
                 selectedIteration={selectedIteration}
-                onSelectIteration={setSelectedIteration}
               />
             </div>
           </ResizablePanel>

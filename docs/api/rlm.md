@@ -211,7 +211,7 @@ rlm = RLM(..., max_iterations=50)
 **Type:** `float | None`
 **Default:** `None`
 
-Maximum total USD cost for a completion. If exceeded, raises `BudgetExceededError`. Requires a backend that reports cost.
+Maximum observed USD cost for a completion. If exceeded, raises `BudgetExceededError`. Requires a backend that reports cost. This is a postpaid check, not a reservation or hard provider-side spending cap. Each child receives the latest observed remaining-budget snapshot; concurrent root and child calls may spend against the same snapshot before usage is reported.
 
 ---
 
@@ -339,7 +339,7 @@ Enable rich console output showing:
 
 When enabled, reuses the same environment across multiple `completion()` calls. This enables multi-turn conversations where each call adds a new context and the model retains all previous variables and state.
 
-Contexts are versioned (`context_0`, `context_1`, ...) with `context` always aliasing `context_0`. Conversation histories from previous calls are available as `history_0`, `history_1`, etc.
+Contexts are versioned (`context_0`, `context_1`, ...) with `context` always aliasing `context_0`. Conversation histories from previous calls are available as `history_0`, `history_1`, etc. Persistence is supported by the local, IPython, and Docker environments; unsupported combinations are rejected when `RLM` is constructed.
 
 Supports the context manager protocol for automatic cleanup:
 
@@ -375,7 +375,7 @@ custom_tools = {
 }
 ```
 
-Reserved names (`llm_query`, `rlm_query`, `context`, `history`, `answer`, `SHOW_VARS`, and their batched variants) cannot be used as tool names.
+Reserved names (`llm_query`, `rlm_query`, `context`, `history`, `answer`, `SHOW_VARS`, and their batched variants) cannot be used as tool names. Custom tools are supported by the local, IPython, Docker, and Daytona environments. Docker and Daytona accept Python code strings or JSON-serializable values rather than host callables. Unsupported combinations are rejected when `RLM` is constructed.
 
 ---
 
@@ -395,7 +395,7 @@ Separate set of custom tools for child RLMs spawned via `rlm_query()`. If `None`
 **Type:** `bool`
 **Default:** `False`
 
-When enabled, automatically summarizes the conversation history when token usage exceeds `compaction_threshold_pct` of the model's context window. The full history (including summaries) is available in the REPL as the `history` variable.
+When enabled, automatically summarizes the conversation history when token usage exceeds `compaction_threshold_pct` of the model's context window. The full history (including summaries) is available in the REPL as the `history` variable. Compaction is supported by the local and Docker environments; unsupported combinations are rejected when `RLM` is constructed.
 
 ---
 
@@ -480,11 +480,15 @@ result = rlm.completion(
 class RLMChatCompletion:
     root_model: str              # Model name used
     prompt: str | dict           # Original input
-    response: str                # Final answer
+    response: str                # Text form of the final answer
     usage_summary: UsageSummary  # Token usage
     execution_time: float        # Total seconds
     metadata: dict | None        # Full trajectory when logger is provided
+    error: str | None            # Canonical failure, when this call failed
+    final: FinalValue            # Optional structured JSON final
 ```
+
+`response` remains text-only for LM and recursive query callers. If the RLM submits a structured JSON final, `response` contains its JSON text and `final.value` preserves the structured value. Check `final.is_present` before reading `final.value`. This distinction also preserves an explicit JSON `null` final.
 
 #### Example
 
@@ -517,7 +521,9 @@ result: RLMChatCompletion = rlm.completion(...)
 
 result.root_model      # "gpt-4o"
 result.prompt          # Original input
-result.response        # Final answer string
+result.response        # Final answer as text
+result.final.is_present
+result.final.value     # Structured JSON final, when present
 result.execution_time  # Total time in seconds
 result.usage_summary   # UsageSummary object
 result.metadata        # Full trajectory dict (if logger provided)
@@ -556,6 +562,8 @@ The following functions are available to model-generated code inside the REPL:
 | `answer` | A dict (`{"content": "", "ready": False}`). Set `answer["content"]` to your final answer and `answer["ready"] = True` to terminate the run. |
 | `SHOW_VARS()` | List all user-created variables in the REPL. |
 | `print(...)` | Print output visible to the model in the next iteration. |
+
+Subprocess IPython cells also expose async handle operations through `rlm`: `await rlm.spawn(...)`, `await rlm.gather(handles)`, `await rlm.release(handles)`, and `await rlm.final(value)`. `gather` returns validated `ChildResult` objects with both attribute and mapping access. Successful cells may leave handles for later cells. A successful gather delivers each handle once. Transport retries recover unacknowledged delivery, while later gathers reject consumed handles. Explicitly release handles that will not be gathered.
 
 ---
 

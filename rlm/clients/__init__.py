@@ -1,11 +1,7 @@
 from typing import Any
 
-from dotenv import load_dotenv
-
 from rlm.clients.base_lm import BaseLM
 from rlm.core.types import ClientBackend
-
-load_dotenv()
 
 
 def get_client(
@@ -16,6 +12,10 @@ def get_client(
     Routes a specific backend and the args (as a dict) to the appropriate client if supported.
     Currently supported backends: ['openai']
     """
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
     if backend == "openai":
         from rlm.clients.openai import OpenAIClient
 

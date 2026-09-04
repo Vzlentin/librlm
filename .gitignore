@@ -146,6 +146,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+/.rlm_workspace/
 env/
 venv/
 ENV/

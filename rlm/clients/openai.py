@@ -5,7 +5,7 @@ from typing import Any
 import openai
 from dotenv import load_dotenv
 
-from rlm.clients.base_lm import BaseLM
+from rlm.clients.base_lm import DEFAULT_TIMEOUT, BaseLM
 from rlm.core.types import ModelUsageSummary, UsageSummary
 
 load_dotenv()
@@ -56,10 +56,11 @@ class OpenAIClient(BaseLM):
         api_key: str | None = None,
         model_name: str | None = None,
         base_url: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
         sampling_args: dict[str, Any] | None = None,
-        **kwargs,
+        **client_kwargs: Any,
     ):
-        super().__init__(model_name=model_name, sampling_args=sampling_args, **kwargs)
+        super().__init__(model_name=model_name, timeout=timeout, sampling_args=sampling_args)
 
         if api_key is None:
             if base_url == "https://api.openai.com/v1" or base_url is None:
@@ -77,7 +78,7 @@ class OpenAIClient(BaseLM):
             "api_key": api_key,
             "base_url": base_url,
             "timeout": self.timeout,
-            **{k: v for k, v in self.kwargs.items() if k != "model_name"},
+            **client_kwargs,
         }
         self.client = openai.OpenAI(**client_kwargs)
         self.async_client = openai.AsyncOpenAI(**client_kwargs)
@@ -88,7 +89,6 @@ class OpenAIClient(BaseLM):
         self.model_call_counts: dict[str, int] = defaultdict(int)
         self.model_input_tokens: dict[str, int] = defaultdict(int)
         self.model_output_tokens: dict[str, int] = defaultdict(int)
-        self.model_total_tokens: dict[str, int] = defaultdict(int)
         self.model_costs: dict[str, float] = defaultdict(float)  # Cost in USD
 
     def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
@@ -154,7 +154,6 @@ class OpenAIClient(BaseLM):
 
         self.model_input_tokens[model] += usage.prompt_tokens
         self.model_output_tokens[model] += usage.completion_tokens
-        self.model_total_tokens[model] += usage.total_tokens
 
         # Track last call for handler to read
         self.last_prompt_tokens = usage.prompt_tokens

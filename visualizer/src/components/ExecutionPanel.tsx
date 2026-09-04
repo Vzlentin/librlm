@@ -28,7 +28,7 @@ export function ExecutionPanel({ iteration }: ExecutionPanelProps) {
   }
 
   const totalSubCalls = iteration.code_blocks.reduce(
-    (acc, block) => acc + (block.result?.rlm_calls?.length || 0), 
+    (acc, block) => acc + block.result.rlm_calls.length,
     0
   );
 
@@ -60,7 +60,7 @@ export function ExecutionPanel({ iteration }: ExecutionPanelProps) {
               {totalSubCalls} sub-LM call{totalSubCalls !== 1 ? 's' : ''}
             </Badge>
           )}
-          {iteration.final_answer && (
+          {iteration.final.has_final && (
             <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30 text-xs">
               Has Final Answer
             </Badge>
@@ -113,7 +113,7 @@ export function ExecutionPanel({ iteration }: ExecutionPanelProps) {
               <div className="p-4 space-y-4">
                 {totalSubCalls > 0 ? (
                   iteration.code_blocks.flatMap((block, blockIdx) =>
-                    (block.result?.rlm_calls || []).map((call, callIdx) => (
+                    block.result.rlm_calls.map((call, callIdx) => (
                       <Card 
                         key={`${blockIdx}-${callIdx}`}
                         className="border-fuchsia-500/30 bg-fuchsia-500/5 dark:border-fuchsia-400/30 dark:bg-fuchsia-400/5"

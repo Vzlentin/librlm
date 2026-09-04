@@ -15,25 +15,25 @@ class BaseLM(ABC):
 
     def __init__(
         self,
-        model_name: str,
+        model_name: str | None,
         timeout: float = DEFAULT_TIMEOUT,
         sampling_args: dict[str, Any] | None = None,
-        **kwargs,
-    ):
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
         self.model_name = model_name
         self.timeout = timeout
         # Sampling args forwarded to the underlying completion API
         # (e.g. temperature, top_p, max_tokens, seed). Forwarded by
         # subclasses as **self.sampling_args.
         self.sampling_args: dict[str, Any] = dict(sampling_args or {})
-        self.kwargs = kwargs
 
     @abstractmethod
-    def completion(self, prompt: str | dict[str, Any]) -> str:
+    def completion(self, prompt: str | list[dict[str, Any]]) -> str:
         raise NotImplementedError
 
     @abstractmethod
-    async def acompletion(self, prompt: str | dict[str, Any]) -> str:
+    async def acompletion(self, prompt: str | list[dict[str, Any]]) -> str:
         raise NotImplementedError
 
     @abstractmethod

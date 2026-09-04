@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from rlm.core.accounting import CompletionFinalization
 from rlm.core.types import REPLResult
 
 # =============================================================================
@@ -18,10 +20,27 @@ RESERVED_TOOL_NAMES: frozenset[str] = frozenset(
         "rlm_query_batched",
         "SHOW_VARS",
         "answer",
+        "input",
+        "rlm",
         "context",
         "history",
     }
 )
+
+
+class FinalAnswerDict(dict[str, Any]):
+    """REPL-visible final-answer scaffold with atomic ready signaling."""
+
+    def __init__(self, on_ready: Callable[[Any], None]) -> None:
+        if not callable(on_ready):
+            raise TypeError("final-answer callback must be callable")
+        super().__init__(content="", ready=False)
+        self._on_ready = on_ready
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key == "ready" and value:
+            self._on_ready(self.get("content", ""))
+        super().__setitem__(key, value)
 
 
 @dataclass
@@ -56,9 +75,9 @@ def parse_tool_entry(name: str, entry: Any) -> ToolInfo:
     if isinstance(entry, dict) and "tool" in entry:
         value = entry["tool"]
         description = entry.get("description")
-        if description is not None and isinstance(description, str):
-            return ToolInfo(name=name, value=value, description=description)
-        return ToolInfo(name=name, value=value, description=None)
+        if description is not None and not isinstance(description, str):
+            raise TypeError(f"Custom tool {name!r} description must be a string or None")
+        return ToolInfo(name=name, value=value, description=description)
     # No description - treat as plain value
     return ToolInfo(name=name, value=entry, description=None)
 
@@ -107,9 +126,6 @@ def format_tools_for_prompt(custom_tools: dict[str, Any] | None) -> str | None:
         return None
 
     tool_infos = parse_custom_tools(custom_tools)
-    if not tool_infos:
-        return None
-
     lines = []
     for tool in tool_infos:
         if tool.is_callable:
@@ -214,12 +230,14 @@ class BaseEnv(ABC):
     """
 
     def __init__(
-        self, persistent: bool = False, depth: int = 1, max_concurrent_subcalls: int = 4, **kwargs
-    ):
+        self,
+        persistent: bool = False,
+        depth: int = 1,
+        max_concurrent_subcalls: int = 4,
+    ) -> None:
         self.persistent = persistent
         self.depth = depth
         self.max_concurrent_subcalls = max_concurrent_subcalls
-        self.kwargs = kwargs
 
     @abstractmethod
     def setup(self):
@@ -231,52 +249,34 @@ class BaseEnv(ABC):
 
     @abstractmethod
     def execute_code(self, code: str) -> REPLResult:
+        raise NotImplementedError
+
+    def finalize_completion(self) -> CompletionFinalization:
+        """Join completion-owned work and return its final accounting outcome."""
+        return CompletionFinalization()
+
+    @abstractmethod
+    def cleanup(self) -> None:
+        """Release every resource owned by the environment."""
         raise NotImplementedError
 
 
 class IsolatedEnv(BaseEnv, ABC):
-    """
-    These environments (e.g. Prime Envs, Modal Envs) sit on a completely separate machine from the LM,
-    guaranteeing complete isolation from the LM process.
-    """
-
-    def __init__(self, persistent: bool = False, **kwargs):
-        super().__init__(persistent=persistent, **kwargs)
-
-    @abstractmethod
-    def setup(self):
-        raise NotImplementedError
-
-    @abstractmethod
-    def load_context(self, context_payload: dict | list | str):
-        raise NotImplementedError
-
-    @abstractmethod
-    def execute_code(self, code: str) -> REPLResult:
-        raise NotImplementedError
+    """Marker for environments running on a machine isolated from the LM."""
 
 
 class NonIsolatedEnv(BaseEnv, ABC):
-    """
-    These environments run on the same machine as the LM, and provide different levels of isolation
-    depending on the choice of environment. The simplest, default is a local Python REPL that runs
-    as a subprocess.
-    """
+    """Marker for environments running on the LM host."""
 
-    def __init__(self, persistent: bool = False, **kwargs):
-        super().__init__(persistent=persistent, **kwargs)
 
-    @abstractmethod
-    def setup(self):
-        raise NotImplementedError
+@runtime_checkable
+class SupportsCompaction(Protocol):
+    """Environment capability required by root-history compaction."""
 
-    @abstractmethod
-    def load_context(self, context_payload: dict | list | str):
-        raise NotImplementedError
-
-    @abstractmethod
-    def execute_code(self, code: str) -> REPLResult:
-        raise NotImplementedError
+    def append_compaction_entry(
+        self,
+        entry: list[dict[str, Any]] | dict[str, Any],
+    ) -> None: ...
 
 
 @runtime_checkable

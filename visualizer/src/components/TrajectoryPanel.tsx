@@ -3,12 +3,11 @@
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
-import { RLMIteration, extractFinalAnswer } from '@/lib/types';
+import { RLMIteration, formatFinal } from '@/lib/types';
 
 interface TrajectoryPanelProps {
   iterations: RLMIteration[];
   selectedIteration: number;
-  onSelectIteration: (index: number) => void;
 }
 
 // Helper to format message content for display
@@ -93,7 +92,7 @@ export function TrajectoryPanel({
               {currentIteration.code_blocks.length} code
             </Badge>
           )}
-          {currentIteration?.final_answer && (
+          {currentIteration?.final.has_final && (
             <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 text-[10px]">
               ✓ Answer
             </Badge>
@@ -176,7 +175,7 @@ export function TrajectoryPanel({
             )}
 
             {/* Final answer highlight */}
-            {currentIteration?.final_answer && (
+            {currentIteration?.final.has_final && (
               <div className="rounded-xl border-2 border-emerald-500/50 bg-gradient-to-br from-emerald-500/15 to-green-500/15 p-4 shadow-lg shadow-emerald-500/10">
                 <div className="flex items-center gap-3 mb-3">
                   <div className="w-10 h-10 rounded-full bg-gradient-to-br from-emerald-500 to-green-600 flex items-center justify-center shadow-lg shadow-emerald-500/30">
@@ -195,7 +194,7 @@ export function TrajectoryPanel({
                 </div>
                 <div className="bg-background/80 rounded-lg p-4 border border-emerald-500/30">
                   <p className="text-[15px] font-medium text-foreground leading-relaxed">
-                    {extractFinalAnswer(currentIteration.final_answer)}
+                    {formatFinal(currentIteration.final)}
                   </p>
                 </div>
               </div>

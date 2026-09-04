@@ -98,16 +98,3 @@ export function AsciiRLM() {
     </div>
   );
 }
-
-// Compact inline diagram for header
-export function AsciiRLMInline() {
-  return (
-    <div className="font-mono text-[9px] leading-tight select-none text-muted-foreground">
-      <span className="text-primary">Prompt</span>
-      <span> → </span>
-      <span className="text-emerald-600 dark:text-emerald-400">[LM ↔ REPL]</span>
-      <span> → </span>
-      <span className="text-amber-600 dark:text-amber-400">Answer</span>
-    </div>
-  );
-}

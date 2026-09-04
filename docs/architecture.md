@@ -208,7 +208,7 @@ LocalREPL._rlm_query()
     │      falls back to _llm_query()
     │
     ▼  (when subcall_fn exists)
-RLM._subcall(prompt, model)
+RLM.subcall(prompt, model)
     │  next_depth = self.depth + 1
     │  if next_depth >= max_depth:
     │      → plain client.completion() (leaf call, no REPL)
@@ -250,12 +250,12 @@ RLM (depth=0)
 
 - `depth=0` is the root RLM that the user calls.
 - Each child increments depth by 1.
-- When `next_depth >= max_depth`, `_subcall()` does a plain `client.completion()` instead of creating a child RLM. This is the leaf case — no REPL, no iteration.
+- When `next_depth >= max_depth`, `subcall()` does a plain `client.completion()` instead of creating a child RLM. This is the leaf case — no REPL, no iteration.
 - `llm_query()` always does a plain LM call regardless of depth. Only `rlm_query()` triggers recursion.
 
 ### Each child gets its own handler and environment
 
-When a child RLM is created via `_subcall()`, its `completion()` method calls
+When a child RLM is created via `subcall()`, its `completion()` method calls
 `_spawn_completion_context()` which creates:
 
 1. **A new `LMHandler`** listening on a **different auto-assigned port**.
@@ -267,7 +267,7 @@ Parent RLM (depth=0)
 ├── LocalREPL #1 (depth=1)
 │   ├── globals: {llm_query, rlm_query, ...}
 │   ├── locals: {context: "parent prompt", ...}
-│   └── subcall_fn = RLM._subcall  ← enables rlm_query()
+│   └── subcall_fn = RLM.subcall  ← enables rlm_query()
 │
 └── When model code calls rlm_query("subtask"):
     │
@@ -275,7 +275,7 @@ Parent RLM (depth=0)
         ├── LMHandler #2 on port 52302  ← NEW handler, NEW port
         ├── LocalREPL #2 (depth=2)      ← NEW namespace
         │   ├── locals: {context: "subtask", ...}
-        │   └── subcall_fn = child._subcall (or None if at max_depth-1)
+        │   └── subcall_fn = child.subcall (or None if at max_depth-1)
         │
         └── Runs its own iteration loop, returns RLMChatCompletion
 ```
@@ -284,15 +284,19 @@ The child's handler and environment are torn down when the child's `completion()
 
 ### Resource limits propagate
 
-The parent passes **remaining** budget/timeout/tokens to the child, not the
-original totals. This prevents a child from consuming all of the parent's resources:
+The parent passes the latest observed remaining budget and timeout to the child,
+not the original totals:
 
 ```python
-# In _subcall():
+# In subcall():
 remaining_timeout = self.max_timeout - elapsed  # not self.max_timeout
-remaining_budget = self.max_budget - spent       # not self.max_budget
+remaining_budget = self.max_budget - observed_spend
 child = RLM(..., max_timeout=remaining_timeout, max_budget=remaining_budget)
 ```
+
+Budget propagation is postpaid and does not reserve spend. Concurrent root and
+child calls can use the same observed snapshot and exceed the configured amount
+before the next iteration or final usage check raises `BudgetExceededError`.
 
 ### Metadata flows back
 
@@ -326,7 +330,7 @@ RLM (depth=0)
  │       │
  │       ├─ rlm_query() → _rlm_query() → subcall_fn()
  │       │   │
- │       │   └─ RLM._subcall("What patterns exist in: ...")
+ │       │   └─ RLM.subcall("What patterns exist in: ...")
  │       │       │
  │       │       ├─ depth=1 < max_depth=2, so create child RLM
  │       │       │
@@ -358,7 +362,7 @@ RLM (depth=0)
 | Code execution | In-process `exec()` in the same Python interpreter. Not a subprocess. |
 | LM calls from code | Go through a local TCP socket server (LMHandler), even for in-process execution. |
 | Handler per completion | Each `completion()` call gets its own handler on an auto-assigned port. |
-| Child RLMs | Created by `_subcall()`, each with its own handler + LocalREPL. Fully independent. |
+| Child RLMs | Created by `subcall()`, each with its own handler + LocalREPL. Fully independent. |
 | `llm_query` vs `rlm_query` | `llm_query` = always plain LM call. `rlm_query` = recursive child RLM (or fallback). |
 | Depth limit | At `max_depth`, `rlm_query` falls back to `llm_query`. No further recursion. |
 | Resource isolation | Children get remaining budget/timeout, not the full amount. |

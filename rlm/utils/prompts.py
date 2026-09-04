@@ -249,7 +249,6 @@ USER_PROMPT = "Turn {iter_1}/{max_iter}:"
 
 
 def build_user_prompt(
-    root_prompt: str | None = None,
     iteration: int = 0,
     context_count: int = 1,
     history_count: int = 0,

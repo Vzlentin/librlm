@@ -322,26 +322,27 @@ def rlm_query_batched(prompts, model=None):
         return [f"Error: {{e}}"] * len(prompts)
 
 def load_state():
-    if os.path.exists(STATE):
-        try:
-            with open(STATE, "rb") as f:
-                return dill.load(f)
-        except Exception:
-            pass
-    return {{}}
+    if not os.path.exists(STATE):
+        return {{}}
+    with open(STATE, "rb") as f:
+        return dill.load(f)
 
 def save_state(s):
     clean = {{}}
+    skipped = []
     for k, v in s.items():
         if k.startswith("_"):
             continue
         try:
             dill.dumps(v)
             clean[k] = v
-        except Exception:
-            pass
-    with open(STATE, "wb") as f:
+        except Exception as error:
+            skipped.append((k, f"{{type(error).__name__}}: {{error}}"))
+    temporary_state = STATE + ".tmp"
+    with open(temporary_state, "wb") as f:
         dill.dump(clean, f)
+    os.replace(temporary_state, STATE)
+    return skipped
 
 _locals = load_state()
 
@@ -390,7 +391,8 @@ if "context_0" in _locals:
     _locals["context"] = _locals["context_0"]
 {history_alias}
 
-save_state(_locals)
+for _name, _error in save_state(_locals):
+    stderr_buf.write(f"Warning: variable {{_name!r}} was not persisted: {{_error}}\\n")
 _ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
 _final = None
 if _ans is not None and _ans.get("ready"):
@@ -414,7 +416,7 @@ class DockerREPL(NonIsolatedEnv):
     Supports:
         - llm_query / llm_query_batched : single LM completions
         - rlm_query  / rlm_query_batched : recursive RLM sub-calls (needs subcall_fn)
-        - custom_tools / custom_sub_tools : injected functions/data
+        - custom_tools            : injected functions/data
         - answer["ready"] = True : final-answer signaling
         - persistent multi-turn sessions : versioned context_N / history_N reuse
           across completion() calls (the container and its dill state are kept
@@ -432,16 +434,13 @@ class DockerREPL(NonIsolatedEnv):
         depth: int = 1,
         subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
         custom_tools: dict[str, Any] | None = None,
-        custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
         max_concurrent_subcalls: int = 4,
-        **kwargs,
     ):
         super().__init__(
             persistent=persistent,
             depth=depth,
             max_concurrent_subcalls=max_concurrent_subcalls,
-            **kwargs,
         )
 
         self.image = image
@@ -463,10 +462,6 @@ class DockerREPL(NonIsolatedEnv):
 
         # Custom tools: functions/data available in the REPL.
         self.custom_tools = custom_tools or {}
-        # Sub-tools inherit from custom_tools unless explicitly provided.
-        self.custom_sub_tools = (
-            custom_sub_tools if custom_sub_tools is not None else self.custom_tools
-        )
         validate_custom_tools(self.custom_tools)
 
         base_dir = os.environ.get(
@@ -731,36 +726,76 @@ class DockerREPL(NonIsolatedEnv):
         """Tear down the container, proxy server, and workspace. Idempotent."""
         if getattr(self, "_cleaned_up", False):
             return
-        self._cleaned_up = True
 
-        # Force-remove the container (fast; --rm cleans the rest). Best-effort
-        # removal of root-owned workspace files from inside the container first,
-        # so the host rmtree below doesn't leave permission-denied garbage.
-        if getattr(self, "container_id", None):
-            subprocess.run(
+        errors: list[BaseException] = []
+        container_id = getattr(self, "container_id", None)
+        if container_id:
+            workspace_cleanup = subprocess.run(
                 [
                     "docker",
                     "exec",
-                    self.container_id,
+                    container_id,
                     "sh",
                     "-c",
-                    "rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true",
+                    "rm -rf /workspace/* /workspace/.[!.]*",
                 ],
                 capture_output=True,
+                text=True,
             )
-            subprocess.run(["docker", "rm", "-f", self.container_id], capture_output=True)
-            self.container_id = None
+            if workspace_cleanup.returncode != 0:
+                errors.append(
+                    RuntimeError(
+                        f"Docker workspace cleanup failed: {workspace_cleanup.stderr.strip()}"
+                    )
+                )
+            container_cleanup = subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+            )
+            if container_cleanup.returncode != 0:
+                errors.append(
+                    RuntimeError(
+                        f"Docker container cleanup failed: {container_cleanup.stderr.strip()}"
+                    )
+                )
+            else:
+                self.container_id = None
 
-        if getattr(self, "proxy_server", None):
-            self.proxy_server.shutdown()
-            self.proxy_server.server_close()
-            self.proxy_server = None
-        if getattr(self, "proxy_thread", None):
-            self.proxy_thread.join(timeout=2)
-            self.proxy_thread = None
+        proxy_server = getattr(self, "proxy_server", None)
+        if proxy_server is not None:
+            try:
+                proxy_server.shutdown()
+            except BaseException as error:
+                errors.append(error)
+            try:
+                proxy_server.server_close()
+            except BaseException as error:
+                errors.append(error)
+            else:
+                self.proxy_server = None
 
-        if getattr(self, "temp_dir", None) and os.path.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        proxy_thread = getattr(self, "proxy_thread", None)
+        if proxy_thread is not None:
+            proxy_thread.join(timeout=2)
+            if proxy_thread.is_alive():
+                errors.append(RuntimeError("Docker proxy thread did not stop"))
+            else:
+                self.proxy_thread = None
+
+        temp_dir = getattr(self, "temp_dir", None)
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except BaseException as error:
+                errors.append(error)
+
+        if len(errors) == 1:
+            error = errors[0]
+            raise error.with_traceback(error.__traceback__)
+        if errors:
+            raise BaseExceptionGroup("Docker cleanup failed", errors)
+        self._cleaned_up = True
 
     def __enter__(self):
         return self
@@ -770,4 +805,7 @@ class DockerREPL(NonIsolatedEnv):
         return False
 
     def __del__(self):
-        self.cleanup()
+        try:
+            self.cleanup()
+        except BaseException:
+            pass

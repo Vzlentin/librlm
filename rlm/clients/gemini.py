@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from rlm.clients.base_lm import BaseLM
+from rlm.clients.base_lm import DEFAULT_TIMEOUT, BaseLM
 from rlm.core.types import ModelUsageSummary, UsageSummary
 
 load_dotenv()
@@ -24,9 +24,12 @@ class GeminiClient(BaseLM):
         self,
         api_key: str | None = None,
         model_name: str | None = "gemini-2.5-flash",
-        **kwargs,
+        timeout: float = DEFAULT_TIMEOUT,
+        sampling_args: dict[str, Any] | None = None,
     ):
-        super().__init__(model_name=model_name, **kwargs)
+        super().__init__(model_name=model_name, timeout=timeout, sampling_args=sampling_args)
+        if "system_instruction" in self.sampling_args:
+            raise ValueError("Gemini sampling_args cannot override system_instruction")
 
         if api_key is None:
             api_key = DEFAULT_GEMINI_API_KEY
@@ -45,7 +48,6 @@ class GeminiClient(BaseLM):
         self.model_call_counts: dict[str, int] = defaultdict(int)
         self.model_input_tokens: dict[str, int] = defaultdict(int)
         self.model_output_tokens: dict[str, int] = defaultdict(int)
-        self.model_total_tokens: dict[str, int] = defaultdict(int)
 
         # Last call tracking
         self.last_prompt_tokens = 0
@@ -59,8 +61,11 @@ class GeminiClient(BaseLM):
             raise ValueError("Model name is required for Gemini client.")
 
         config = None
-        if system_instruction:
-            config = types.GenerateContentConfig(system_instruction=system_instruction)
+        if system_instruction or self.sampling_args:
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                **self.sampling_args,
+            )
 
         response = self.client.models.generate_content(
             model=model,
@@ -81,8 +86,11 @@ class GeminiClient(BaseLM):
             raise ValueError("Model name is required for Gemini client.")
 
         config = None
-        if system_instruction:
-            config = types.GenerateContentConfig(system_instruction=system_instruction)
+        if system_instruction or self.sampling_args:
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                **self.sampling_args,
+            )
 
         # google-genai SDK supports async via aio interface
         response = await self.client.aio.models.generate_content(
@@ -137,7 +145,6 @@ class GeminiClient(BaseLM):
 
             self.model_input_tokens[model] += input_tokens
             self.model_output_tokens[model] += output_tokens
-            self.model_total_tokens[model] += input_tokens + output_tokens
 
             # Track last call for handler to read
             self.last_prompt_tokens = input_tokens

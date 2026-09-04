@@ -499,7 +499,8 @@ class TestStateAndOutput:
         # survives across executions.
         repl = make_repl(with_handler=False)
         try:
-            repl.execute_code("gen = (i for i in range(3))\nkeep = 42")
+            first = repl.execute_code("gen = (i for i in range(3))\nkeep = 42")
+            assert "variable 'gen' was not persisted" in first.stderr
             r = repl.execute_code("print(keep)")
             assert r.stdout.strip() == "42", "picklable var lost across executions"
             r2 = repl.execute_code("print('gen' in dir())")

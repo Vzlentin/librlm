@@ -9,8 +9,6 @@ from collections.abc import Callable
 from typing import Any
 
 import verifiers as vf
-from verifiers.types import Messages, State
-
 from rlm.utils.parsing import find_code_blocks
 from rlm.utils.prompts import (
     RLM_SYSTEM_PROMPT,
@@ -18,6 +16,8 @@ from rlm.utils.prompts import (
     build_rlm_system_prompt,
     build_user_prompt,
 )
+from verifiers.types import Messages, State
+
 from rlm_train.proxy import ClientHandle, SubLLMProxy
 from rlm_train.repl.base import ExecResult, ReplBackend
 from rlm_train.repl.subprocess import SubprocessReplBackend
@@ -90,7 +90,6 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         history_count: int,
     ) -> dict[str, str]:
         return build_user_prompt(
-            root_prompt=root_prompt,
             iteration=iteration,
             context_count=context_count,
             history_count=history_count,

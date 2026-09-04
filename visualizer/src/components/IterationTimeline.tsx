@@ -4,7 +4,7 @@ import { useRef, useEffect } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
-import { RLMIteration, extractFinalAnswer } from '@/lib/types';
+import { RLMIteration, formatFinal } from '@/lib/types';
 
 interface IterationTimelineProps {
   iterations: RLMIteration[];
@@ -18,13 +18,9 @@ function getIterationStats(iteration: RLMIteration) {
   let hasError = false;
   
   for (const block of iteration.code_blocks) {
-    if (block.result) {
-      codeExecTime += block.result.execution_time || 0;
-      if (block.result.stderr) hasError = true;
-      if (block.result.rlm_calls) {
-        totalSubCalls += block.result.rlm_calls.length;
-      }
-    }
+    codeExecTime += block.result.execution_time ?? 0;
+    if (block.result.stderr) hasError = true;
+    totalSubCalls += block.result.rlm_calls.length;
   }
   
   // Use iteration_time if available, otherwise fall back to code execution time
@@ -40,7 +36,7 @@ function getIterationStats(iteration: RLMIteration) {
     subCalls: totalSubCalls,
     execTime: iterTime,
     hasError,
-    hasFinal: iteration.final_answer !== null,
+    hasFinal: iteration.final.has_final,
     inputTokens: estimatedInputTokens,
     outputTokens: estimatedOutputTokens,
   };
@@ -88,7 +84,7 @@ export function IterationTimeline({
           {iterations.map((iteration, idx) => {
             const stats = getIterationStats(iteration);
             const isSelected = idx === selectedIteration;
-            const finalAnswer = extractFinalAnswer(iteration.final_answer);
+            const finalAnswer = formatFinal(iteration.final);
             const responseSnippet = iteration.response.slice(0, 60).replace(/\n/g, ' ');
             
             return (
@@ -164,7 +160,7 @@ export function IterationTimeline({
                         <span className="mx-0.5">→</span>
                         <span className="text-emerald-600 dark:text-emerald-400">{(stats.outputTokens / 1000).toFixed(1)}k</span>
                       </span>
-                      {stats.hasFinal && finalAnswer && (
+                      {stats.hasFinal && finalAnswer !== null && (
                         <>
                           <span className="text-border">│</span>
                           <span className="text-amber-600 dark:text-amber-400 truncate max-w-[100px]">

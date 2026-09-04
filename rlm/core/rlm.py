@@ -1,22 +1,43 @@
+import json
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 
 from rlm.clients import BaseLM, get_client
+from rlm.core.accounting import CompletionTransaction, UsageLedger
+from rlm.core.child_execution import (
+    Cancellation,
+    ChildExecution,
+    ChildOutcome,
+    ChildRequest,
+)
+from rlm.core.child_execution import (
+    PreparedChild as _PreparedChild,
+)
 from rlm.core.lm_handler import LMHandler
 from rlm.core.types import (
     ClientBackend,
     CodeBlock,
     EnvironmentType,
+    FinalValue,
+    JSONValue,
+    ModelUsageSummary,
     REPLResult,
     RLMChatCompletion,
     RLMIteration,
     RLMMetadata,
     UsageSummary,
 )
-from rlm.environments import BaseEnv, SupportsPersistence, get_environment
-from rlm.logger import RLMLogger, VerbosePrinter
+from rlm.environments import (
+    BaseEnv,
+    SupportsCompaction,
+    SupportsCustomTools,
+    SupportsPersistence,
+    get_environment,
+    get_environment_capabilities,
+)
+from rlm.logger.rlm_logger import RLMLogger
 from rlm.utils.exceptions import (
     BudgetExceededError,
     CancellationError,
@@ -36,6 +57,21 @@ from rlm.utils.prompts import (
 )
 from rlm.utils.rlm_utils import filter_sensitive_keys
 from rlm.utils.token_utils import count_tokens, get_context_limit
+
+
+def _completion_response(value: JSONValue) -> str:
+    """Render a structured final without widening the text completion interface."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, allow_nan=False)
+
+
+@dataclass(slots=True)
+class _CompletionBody:
+    final: FinalValue
+    response: str
+    iteration_count: int
+    message_history: list[dict[str, Any]]
 
 
 class RLM:
@@ -88,7 +124,7 @@ class RLM:
             depth: The current depth of the RLM (0-indexed).
             max_depth: The maximum depth of recursion. When depth >= max_depth, falls back to plain LM completion.
             max_iterations: The maximum number of iterations of the RLM.
-            max_budget: Maximum budget in USD. Execution stops if exceeded. Requires cost-tracking backend (e.g., OpenRouter).
+            max_budget: Postpaid budget in USD. Execution stops after observed usage exceeds it; concurrent calls do not reserve spend. Requires a cost-tracking backend (e.g., OpenRouter).
             max_timeout: Maximum execution time in seconds. Execution stops if exceeded, returning best answer if available.
             max_tokens: Maximum total tokens (input + output). Execution stops if exceeded, returning best answer if available.
             max_errors: Maximum consecutive errors before stopping. Execution stops if exceeded, returning best answer if available.
@@ -100,7 +136,7 @@ class RLM:
             persistent: If True, reuse the environment across completion() calls for multi-turn conversations.
             custom_tools: Dict of custom functions/tools available in the REPL. Keys are function names,
                 values are callable functions. These are injected into the REPL globals.
-            custom_sub_tools: Dict of custom tools for sub-agents (llm_query calls). If None, inherits
+            custom_sub_tools: Dict of custom tools for child RLMs (rlm_query calls). If None, inherits
                 from custom_tools. Pass an empty dict {} to disable tools for sub-agents.
             compaction: If True, keep full root model history in REPL variable `history` and compact
                 when root context reaches compaction_threshold_pct of the model's context limit.
@@ -144,6 +180,7 @@ class RLM:
         self.environment_kwargs = (
             environment_kwargs.copy() if environment_kwargs is not None else {}
         )
+        self._environment_capabilities = get_environment_capabilities(environment)
         # Validate other_backends: currently only support one additional backend
         if other_backends is not None:
             if len(other_backends) != 1:
@@ -179,6 +216,8 @@ class RLM:
         # depend on a task-specific tips message (e.g. BC+).
         self.user_prologue = user_prologue
         self.logger = logger
+        from rlm.logger.verbose import VerbosePrinter
+
         self.verbose = VerbosePrinter(enabled=verbose)
 
         # Event callbacks for live tree display
@@ -187,8 +226,13 @@ class RLM:
         self.on_iteration_start = on_iteration_start
         self.on_iteration_complete = on_iteration_complete
 
-        # Tracking (cumulative across all calls including children)
-        self._cumulative_cost: float = 0.0
+        # Tracking for the active completion.
+        self._usage_ledger = UsageLedger(max_budget)
+        self._child_execution = ChildExecution(
+            self._prepare_child,
+            settle=self._settle_child_outcome,
+            max_concurrent=max_concurrent_subcalls,
+        )
         self._consecutive_errors: int = 0
         self._last_error: str | None = None
         self._best_partial_answer: str | None = None
@@ -196,11 +240,8 @@ class RLM:
 
         # Persistence support
         self.persistent = persistent
-        self._persistent_env: SupportsPersistence | None = None
-
-        # Validate persistence support at initialization
-        if self.persistent:
-            self._validate_persistent_environment_support()
+        self._persistent_env: BaseEnv | None = None
+        self._validate_environment_capabilities()
 
         # Log metadata if logger is provided
         if self.logger or verbose:
@@ -222,27 +263,17 @@ class RLM:
                 self.logger.log_metadata(metadata)
             self.verbose.print_metadata(metadata)
 
-    @contextmanager
-    def _spawn_completion_context(self, prompt: str | dict[str, Any]):
-        """
-        Spawn an LM handler and environment for a single completion call.
-
-        When persistent=True, the environment is reused across calls.
-        When persistent=False (default), creates fresh environment each call.
-        """
-        # Create client and wrap in handler
+    def _spawn_completion_resources(
+        self,
+        prompt: str | dict[str, Any],
+    ) -> tuple[LMHandler, BaseEnv]:
+        """Create one completion's resources, rolling back partial startup."""
         client: BaseLM = get_client(self.backend, self.backend_kwargs)
-
-        # Create other_backend_client if provided (for depth=1 routing)
         other_backend_client: BaseLM | None = None
         if self.other_backends and self.other_backend_kwargs:
             other_backend_client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
 
         lm_handler = LMHandler(client, other_backend_client=other_backend_client)
-
-        # Register other clients to be available as sub-call options (by model name).
-        # Reuse other_backend_client for the first entry so each (backend, kwargs)
-        # pair is instantiated exactly once.
         if other_backend_client is not None:
             lm_handler.register_client(other_backend_client.model_name, other_backend_client)
             for backend, kwargs in zip(
@@ -250,52 +281,58 @@ class RLM:
                 self.other_backend_kwargs[1:],
                 strict=True,
             ):
-                other_client: BaseLM = get_client(backend, kwargs)
+                other_client = get_client(backend, kwargs)
                 lm_handler.register_client(other_client.model_name, other_client)
 
-        lm_handler.start()
-
-        # Environment: reuse if persistent, otherwise create fresh
-        if self.persistent and self._persistent_env is not None:
-            environment = self._persistent_env
-            # Defensive check: ensure environment supports persistence methods
-            if not self._env_supports_persistence(environment):
-                raise RuntimeError(
-                    f"Persistent environment of type '{type(environment).__name__}' does not "
-                    f"implement required methods (update_handler_address, add_context, get_context_count). "
-                    f"This should have been caught at initialization."
-                )
-            environment.update_handler_address((lm_handler.host, lm_handler.port))
-            environment.add_context(prompt)
-        else:
-            env_kwargs = self.environment_kwargs.copy()
-            env_kwargs["lm_handler_address"] = (lm_handler.host, lm_handler.port)
-            env_kwargs["context_payload"] = prompt
-            env_kwargs["depth"] = self.depth + 1  # Environment depth is RLM depth + 1
-            # For environments that support recursive RLM calls, pass the subcall
-            # callback when max_depth > 1. local/ipython invoke it in-process;
-            # docker invokes it via its host-side proxy (/rlm_query endpoints).
-            if self.environment_type in ("local", "ipython", "docker") and self.max_depth > 1:
-                env_kwargs["subcall_fn"] = self._subcall
-            # Pass custom tools to the environment
-            if self.custom_tools is not None:
-                env_kwargs["custom_tools"] = self.custom_tools
-            if self.custom_sub_tools is not None:
-                env_kwargs["custom_sub_tools"] = self.custom_sub_tools
-            if self.compaction and self.environment_type in ("local", "docker"):
-                env_kwargs["compaction"] = True
-            env_kwargs["max_concurrent_subcalls"] = self.max_concurrent_subcalls
-            environment: BaseEnv = get_environment(self.environment_type, env_kwargs)
-
-            if self.persistent:
-                self._persistent_env = environment
-
+        environment: BaseEnv | None = None
         try:
-            yield lm_handler, environment
-        finally:
-            lm_handler.stop()
-            if not self.persistent and hasattr(environment, "cleanup"):
-                environment.cleanup()
+            lm_handler.start()
+            self._usage_ledger.bind_root(lm_handler.get_usage_summary)
+            if self.persistent and self._persistent_env is not None:
+                environment = self._persistent_env
+                persistent_environment = cast(SupportsPersistence, environment)
+                persistent_environment.update_handler_address(lm_handler.address)
+                persistent_environment.add_context(prompt)
+            else:
+                env_kwargs = self.environment_kwargs.copy()
+                env_kwargs["lm_handler_address"] = lm_handler.address
+                env_kwargs["context_payload"] = prompt
+                env_kwargs["depth"] = self.depth + 1
+                if self._environment_capabilities.recursive_subcalls and self.max_depth > 1:
+                    env_kwargs["subcall_fn"] = self._child_execution
+                if self.custom_tools is not None:
+                    env_kwargs["custom_tools"] = self.custom_tools
+                if self.compaction:
+                    env_kwargs["compaction"] = True
+                if self._environment_capabilities.recursive_subcalls:
+                    env_kwargs["max_concurrent_subcalls"] = self.max_concurrent_subcalls
+                environment = get_environment(self.environment_type, env_kwargs)
+                self._validate_environment_instance(environment)
+                if self.persistent:
+                    self._persistent_env = environment
+            return lm_handler, environment
+        except BaseException as startup_error:
+            rollback_errors: list[BaseException] = []
+            try:
+                lm_handler.stop()
+            except BaseException as error:
+                rollback_errors.append(error)
+            if environment is not None:
+                try:
+                    environment.cleanup()
+                except BaseException as error:
+                    rollback_errors.append(error)
+                else:
+                    if environment is self._persistent_env:
+                        self._persistent_env = None
+            for error in rollback_errors:
+                startup_error.add_note(f"resource rollback also failed: {error!r}")
+            raise
+
+    def _cleanup_completion_environment(self, environment: BaseEnv) -> None:
+        """Clean a non-persistent completion environment."""
+        if not self.persistent:
+            environment.cleanup()
 
     def _setup_prompt(
         self,
@@ -326,173 +363,215 @@ class RLM:
     def completion(
         self, prompt: str | dict[str, Any], root_prompt: str | None = None
     ) -> RLMChatCompletion:
-        """
-        Recursive Language Model completion call. This is the main entry point for querying an RLM, and
-        can replace a regular LM completion call.
-
-        Spawns its own environment and LM handler for the duration of this call.
-
-        Args:
-            prompt: A single string or dictionary of messages to pass as context to the model.
-            root_prompt: We allow the RLM's root LM to see a (small) prompt that the user specifies. A common example of this
-            is if the user is asking the RLM to answer a question, we can pass the question as the root prompt.
-        Returns:
-            A final answer as a string.
-        """
+        """Run one RLM completion with atomic accounting and finalization."""
         time_start = time.perf_counter()
         self._completion_start_time = time_start
-
-        # Reset tracking state for this completion
         self._consecutive_errors = 0
         self._last_error = None
         self._best_partial_answer = None
-        # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
+        self._usage_ledger.reset(self.max_budget)
+
         if self.depth >= self.max_depth:
             return self._fallback_answer(prompt)
 
         if self.logger:
             self.logger.clear_iterations()
 
-        with self._spawn_completion_context(prompt) as (lm_handler, environment):
-            message_history = self._setup_prompt(prompt, root_prompt=root_prompt)
+        lm_handler, environment = self._spawn_completion_resources(prompt)
+        transaction = CompletionTransaction(
+            finalize_environment=environment.finalize_completion,
+            stop_handler=lm_handler.stop,
+            cleanup_environment=(lambda: self._cleanup_completion_environment(environment)),
+            ledger=self._usage_ledger,
+            check_limits=self._check_final_usage_limits,
+        )
+        body, usage = transaction.execute(
+            lambda: self._run_completion_body(
+                prompt,
+                root_prompt,
+                lm_handler,
+                environment,
+                time_start,
+            )
+        )
 
-            compaction_count = 0
-            try:
-                for i in range(self.max_iterations):
-                    # Check timeout before each iteration
-                    self._check_timeout(i, time_start)
+        if self.persistent:
+            cast(SupportsPersistence, environment).add_history(body.message_history)
 
-                    # Compaction: check if context needs summarization
-                    if self.compaction and hasattr(environment, "append_compaction_entry"):
-                        current_tokens, threshold_tokens, max_tokens = self._get_compaction_status(
-                            message_history
-                        )
-                        self.verbose.print_compaction_status(
-                            current_tokens, threshold_tokens, max_tokens
-                        )
-                        if current_tokens >= threshold_tokens:
-                            compaction_count += 1
-                            self.verbose.print_compaction()
-                            message_history = self._compact_history(
-                                lm_handler, environment, message_history, compaction_count
-                            )
+        time_end = time.perf_counter()
+        self.verbose.print_final_answer(
+            body.final.value if body.final.is_present else body.response
+        )
+        self.verbose.print_summary(
+            body.iteration_count,
+            time_end - time_start,
+            usage.to_dict(),
+        )
+        return RLMChatCompletion(
+            root_model=self.backend_kwargs.get("model_name", "unknown")
+            if self.backend_kwargs
+            else "unknown",
+            prompt=prompt,
+            response=body.response,
+            usage_summary=usage,
+            execution_time=time_end - time_start,
+            metadata=self.logger.get_trajectory() if self.logger else None,
+            final=body.final,
+        )
 
-                    context_count = (
-                        environment.get_context_count()
-                        if isinstance(environment, SupportsPersistence)
-                        else 1
+    def _run_completion_body(
+        self,
+        prompt: str | dict[str, Any],
+        root_prompt: str | None,
+        lm_handler: LMHandler,
+        environment: BaseEnv,
+        time_start: float,
+    ) -> _CompletionBody:
+        """Run the linear iteration body owned by a completion transaction."""
+        message_history = self._setup_prompt(prompt, root_prompt=root_prompt)
+        completion_final = FinalValue.absent()
+        response = ""
+        iteration_count = self.max_iterations
+        compaction_count = 0
+        persistent_environment = cast(SupportsPersistence, environment) if self.persistent else None
+        compaction_environment = cast(SupportsCompaction, environment) if self.compaction else None
+
+        try:
+            for i in range(self.max_iterations):
+                self._check_timeout(i, time_start)
+
+                if compaction_environment is not None:
+                    current_tokens, threshold_tokens, max_tokens = self._get_compaction_status(
+                        message_history
                     )
-                    history_count = (
-                        environment.get_history_count()
-                        if isinstance(environment, SupportsPersistence)
-                        else 0
+                    self.verbose.print_compaction_status(
+                        current_tokens,
+                        threshold_tokens,
+                        max_tokens,
                     )
-                    # Fully prefixed trajectory: persist the per-turn user prompt
-                    # into message_history so the model sees a single continuous
-                    # [system, metadata, user_0, assistant_0, repl_0, user_1, ...]
-                    # chain across turns.
-                    message_history.append(
-                        build_user_prompt(
-                            root_prompt,
-                            i,
-                            context_count,
-                            history_count,
-                            max_iterations=self.max_iterations,
+                    if current_tokens >= threshold_tokens:
+                        compaction_count += 1
+                        self.verbose.print_compaction()
+                        message_history = self._compact_history(
+                            lm_handler,
+                            compaction_environment,
+                            message_history,
+                            compaction_count,
                         )
-                    )
 
-                    iteration: RLMIteration = self._completion_turn(
+                context_count = (
+                    persistent_environment.get_context_count()
+                    if persistent_environment is not None
+                    else 1
+                )
+                history_count = (
+                    persistent_environment.get_history_count()
+                    if persistent_environment is not None
+                    else 0
+                )
+                message_history.append(
+                    build_user_prompt(
+                        iteration=i,
+                        context_count=context_count,
+                        history_count=history_count,
+                        max_iterations=self.max_iterations,
+                    )
+                )
+
+                iteration_number = i + 1
+                if self.on_iteration_start is not None:
+                    try:
+                        self.on_iteration_start(self.depth, iteration_number)
+                    except Exception:
+                        pass
+                iteration_started = time.perf_counter()
+                try:
+                    iteration = self._completion_turn(
                         prompt=message_history,
                         lm_handler=lm_handler,
                         environment=environment,
                     )
+                finally:
+                    if self.on_iteration_complete is not None:
+                        try:
+                            self.on_iteration_complete(
+                                self.depth,
+                                iteration_number,
+                                time.perf_counter() - iteration_started,
+                            )
+                        except Exception:
+                            pass
+                self._check_iteration_limits(iteration, i)
 
-                    # Check error/budget/token limits after each iteration
-                    self._check_iteration_limits(iteration, i, lm_handler)
+                final = next(
+                    (
+                        block.result.final
+                        for block in iteration.code_blocks
+                        if block.result.final.is_present
+                    ),
+                    FinalValue.absent(),
+                )
+                iteration.final = final
 
-                    # The REPL signals completion by populating
-                    # ``answer["content"]`` and setting ``answer["ready"] = True``.
-                    # Each environment surfaces that on ``REPLResult.final_answer``.
-                    final_answer = None
-                    final_answer_set = False
-                    for block in iteration.code_blocks:
-                        if getattr(
-                            block.result,
-                            "has_final_answer",
-                            getattr(block.result, "final_answer", None) is not None,
-                        ):
-                            final_answer = block.result.final_answer
-                            final_answer_set = True
-                            break
-                    iteration.final_answer = final_answer
+                if iteration.response and iteration.response.strip():
+                    self._best_partial_answer = iteration.response
+                if self.logger:
+                    self.logger.log(iteration)
+                self.verbose.print_iteration(iteration, i + 1)
 
-                    # Store as best partial answer (most recent response with content)
-                    if iteration.response and iteration.response.strip():
-                        self._best_partial_answer = iteration.response
+                if final.is_present:
+                    completion_final = final
+                    response = _completion_response(final.value)
+                    iteration_count = i + 1
+                    break
 
-                    # If logger is used, log the iteration.
-                    if self.logger:
-                        self.logger.log(iteration)
+                new_messages = format_iteration(iteration)
+                message_history.extend(new_messages)
+                if compaction_environment is not None:
+                    compaction_environment.append_compaction_entry(new_messages)
+        except KeyboardInterrupt:
+            self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
+            raise CancellationError(
+                partial_answer=self._best_partial_answer,
+                message="Execution cancelled by user (Ctrl+C)",
+            ) from None
 
-                    # Verbose output for this iteration
-                    self.verbose.print_iteration(iteration, i + 1)
+        if not completion_final.is_present:
+            response = self._default_answer(message_history, lm_handler)
 
-                    if final_answer_set:
-                        time_end = time.perf_counter()
-                        usage = lm_handler.get_usage_summary()
-                        self.verbose.print_final_answer(final_answer)
-                        self.verbose.print_summary(i + 1, time_end - time_start, usage.to_dict())
+        return _CompletionBody(
+            completion_final,
+            response,
+            iteration_count,
+            message_history,
+        )
 
-                        # Store message history in persistent environment
-                        if self.persistent and isinstance(environment, SupportsPersistence):
-                            environment.add_history(message_history)
-
-                        return RLMChatCompletion(
-                            root_model=self.backend_kwargs.get("model_name", "unknown")
-                            if self.backend_kwargs
-                            else "unknown",
-                            prompt=prompt,
-                            response=final_answer,
-                            usage_summary=usage,
-                            execution_time=time_end - time_start,
-                            metadata=self.logger.get_trajectory() if self.logger else None,
-                        )
-
-                    # Format the iteration for the next prompt.
-                    new_messages = format_iteration(iteration)
-
-                    # Update message history with the new messages.
-                    message_history.extend(new_messages)
-                    if self.compaction and hasattr(environment, "append_compaction_entry"):
-                        environment.append_compaction_entry(new_messages)
-
-            except KeyboardInterrupt:
-                self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
-                raise CancellationError(
-                    partial_answer=self._best_partial_answer,
-                    message="Execution cancelled by user (Ctrl+C)",
-                ) from None
-
-            # Default behavior: we run out of iterations, provide one final answer
-            time_end = time.perf_counter()
-            final_answer = self._default_answer(message_history, lm_handler)
-            usage = lm_handler.get_usage_summary()
-            self.verbose.print_final_answer(final_answer)
-            self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
-
-            # Store message history in persistent environment
-            if self.persistent and isinstance(environment, SupportsPersistence):
-                environment.add_history(message_history)
-
-            return RLMChatCompletion(
-                root_model=self.backend_kwargs.get("model_name", "unknown")
-                if self.backend_kwargs
-                else "unknown",
-                prompt=prompt,
-                response=final_answer,
-                usage_summary=usage,
-                execution_time=time_end - time_start,
-                metadata=self.logger.get_trajectory() if self.logger else None,
+    def _check_final_usage_limits(self, usage: UsageSummary) -> None:
+        """Check usage settled while the environment was being finalized."""
+        current_cost = usage.total_cost or 0.0
+        if self.max_budget is not None and current_cost > self.max_budget:
+            self.verbose.print_budget_exceeded(current_cost, self.max_budget)
+            raise BudgetExceededError(
+                spent=current_cost,
+                budget=self.max_budget,
+                message=(
+                    f"Budget exceeded after completion: spent ${current_cost:.6f} "
+                    f"of ${self.max_budget:.6f} budget"
+                ),
+            )
+        total_tokens = usage.total_input_tokens + usage.total_output_tokens
+        if self.max_tokens is not None and total_tokens > self.max_tokens:
+            self.verbose.print_limit_exceeded(
+                "tokens", f"{total_tokens:,} of {self.max_tokens:,} tokens"
+            )
+            raise TokenLimitExceededError(
+                tokens_used=total_tokens,
+                token_limit=self.max_tokens,
+                partial_answer=self._best_partial_answer,
+                message=(
+                    f"Token limit exceeded after completion: {total_tokens:,} "
+                    f"of {self.max_tokens:,} tokens"
+                ),
             )
 
     def _check_timeout(self, iteration: int, time_start: float) -> None:
@@ -515,9 +594,7 @@ class RLM:
                 ),
             )
 
-    def _check_iteration_limits(
-        self, iteration: RLMIteration, iteration_num: int, lm_handler: LMHandler
-    ) -> None:
+    def _check_iteration_limits(self, iteration: RLMIteration, iteration_num: int) -> None:
         """Check error tracking, budget, and token limits after an iteration.
 
         Raises ErrorThresholdExceededError, BudgetExceededError, or TokenLimitExceededError
@@ -554,26 +631,24 @@ class RLM:
                 ),
             )
 
+        current_usage = self._usage_ledger.summary()
+
         # Check budget
         if self.max_budget is not None:
-            current_usage = lm_handler.get_usage_summary()
             current_cost = current_usage.total_cost or 0.0
-            self._cumulative_cost = current_cost
-            if self._cumulative_cost > self.max_budget:
-                self.verbose.print_budget_exceeded(self._cumulative_cost, self.max_budget)
+            if current_cost > self.max_budget:
+                self.verbose.print_budget_exceeded(current_cost, self.max_budget)
                 raise BudgetExceededError(
-                    spent=self._cumulative_cost,
+                    spent=current_cost,
                     budget=self.max_budget,
                     message=(
                         f"Budget exceeded after iteration {iteration_num + 1}: "
-                        f"spent ${self._cumulative_cost:.6f} "
-                        f"of ${self.max_budget:.6f} budget"
+                        f"spent ${current_cost:.6f} of ${self.max_budget:.6f} budget"
                     ),
                 )
 
         # Check token limit
         if self.max_tokens is not None:
-            current_usage = lm_handler.get_usage_summary()
             total_tokens = current_usage.total_input_tokens + current_usage.total_output_tokens
             if total_tokens > self.max_tokens:
                 self.verbose.print_limit_exceeded(
@@ -600,15 +675,10 @@ class RLM:
         threshold_tokens = int(self.compaction_threshold_pct * max_tokens)
         return current_tokens, threshold_tokens, max_tokens
 
-    def _should_compact(self, message_history: list[dict[str, Any]]) -> bool:
-        """True when root message history is at or over the compaction threshold."""
-        current_tokens, threshold_tokens, _ = self._get_compaction_status(message_history)
-        return current_tokens >= threshold_tokens
-
     def _compact_history(
         self,
         lm_handler: LMHandler,
-        environment: BaseEnv,
+        environment: SupportsCompaction,
         message_history: list[dict[str, Any]],
         compaction_count: int = 1,
     ) -> list[dict[str, Any]]:
@@ -631,8 +701,7 @@ class RLM:
             }
         ]
         summary = lm_handler.completion(summary_prompt)
-        if hasattr(environment, "append_compaction_entry"):
-            environment.append_compaction_entry({"type": "summary", "content": summary})
+        environment.append_compaction_entry({"type": "summary", "content": summary})
         # Keep system + initial assistant (metadata), then summary + continue
         new_history = message_history[:2] + [
             {"role": "assistant", "content": summary},
@@ -709,26 +778,33 @@ class RLM:
         response = client.completion(message)
         return response
 
-    def _subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
-        """
-        Handle a subcall from the environment, potentially spawning a child RLM.
+    def subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
+        """Execute one recursive child through the canonical child module."""
+        request = ChildRequest(task=prompt, model=model)
+        return self._child_execution.run(request).unwrap_completion()
 
-        This method is passed as a callback to LocalREPL to enable recursive RLM calls.
-        When depth allows, it spawns a child RLM with its own REPL. At max depth,
-        it falls back to a plain LM completion.
+    def _settle_child_outcome(self, outcome: ChildOutcome) -> None:
+        if not isinstance(outcome.usage, UsageSummary):
+            raise TypeError("integrated child execution must report a UsageSummary")
+        self._usage_ledger.settle(outcome.usage)
 
-        Args:
-            prompt: The prompt to process.
-            model: Optional model name. If specified, the child RLM will use this model
-                instead of inheriting the parent's default backend.
+    @staticmethod
+    def _completed_child(completion: RLMChatCompletion) -> _PreparedChild:
+        return _PreparedChild(
+            execute_child=lambda _cancellation: completion,
+            usage_source=lambda: completion.usage_summary,
+            teardown_child=lambda: None,
+        )
 
-        Returns:
-            The full RLMChatCompletion from either a child RLM or plain LM completion.
-            On error, returns a completion with the error message as the response.
-        """
+    def _prepare_child(
+        self,
+        request: ChildRequest,
+        _cancellation: Cancellation,
+    ) -> _PreparedChild:
+        """Resolve routing and open one fresh runtime for child execution."""
+        prompt = request.prompt
+        model = request.model
         next_depth = self.depth + 1
-
-        # Determine which backend/kwargs to use (model override or parent's default)
         if model is not None:
             child_backend_kwargs = (self.backend_kwargs or {}).copy()
             child_backend_kwargs["model_name"] = model
@@ -736,81 +812,93 @@ class RLM:
             child_backend_kwargs = self.backend_kwargs
         resolved_model = model or (child_backend_kwargs or {}).get("model_name", "unknown")
 
-        # If we'd hit/exceed the cap, do a normal LM completion (no REPL)
+        try:
+            child_budget = self._usage_ledger.remaining_budget()
+        except BudgetExceededError as error:
+            message = f"Budget exhausted (spent ${error.spent:.6f} of ${error.budget:.6f})"
+            return self._completed_child(
+                RLMChatCompletion(
+                    root_model=resolved_model,
+                    prompt=prompt,
+                    response=f"Error: {message}",
+                    usage_summary=UsageSummary.empty(),
+                    execution_time=0.0,
+                    error=message,
+                )
+            )
+
         if next_depth >= self.max_depth:
-            # Use other_backend if available, otherwise use main backend
             if self.other_backends and self.other_backend_kwargs:
                 client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
             else:
                 client = get_client(self.backend, child_backend_kwargs or {})
             root_model = model or client.model_name
-            start_time = time.perf_counter()
-            try:
-                response = client.completion(prompt)
-                end_time = time.perf_counter()
+            latest_usage: UsageSummary | None = None
+
+            def execute_leaf(_cancel: Cancellation) -> RLMChatCompletion:
+                nonlocal latest_usage
+                started = time.perf_counter()
+                try:
+                    response = client.completion(prompt)
+                except Exception as error:
+                    message = f"LM query failed at max depth - {error}"
+                    latest_usage = client.get_usage_summary()
+                    return RLMChatCompletion(
+                        root_model=root_model,
+                        prompt=prompt,
+                        response=f"Error: {message}",
+                        usage_summary=latest_usage,
+                        execution_time=time.perf_counter() - started,
+                        error=message,
+                    )
+
                 model_usage = client.get_last_usage()
-                usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
+                if not isinstance(model_usage, ModelUsageSummary):
+                    raise TypeError("LM client get_last_usage must return ModelUsageSummary")
+                latest_usage = UsageSummary(model_usage_summaries={root_model: model_usage})
                 return RLMChatCompletion(
                     root_model=root_model,
                     prompt=prompt,
                     response=response,
-                    usage_summary=usage_summary,
-                    execution_time=end_time - start_time,
-                )
-            except Exception as e:
-                end_time = time.perf_counter()
-                return RLMChatCompletion(
-                    root_model=root_model,
-                    prompt=prompt,
-                    response=f"Error: LM query failed at max depth - {e}",
-                    usage_summary=UsageSummary(model_usage_summaries={}),
-                    execution_time=end_time - start_time,
+                    usage_summary=latest_usage,
+                    execution_time=time.perf_counter() - started,
                 )
 
-        # Calculate remaining budget for child (if budget tracking enabled)
-        remaining_budget = None
-        if self.max_budget is not None:
-            remaining_budget = self.max_budget - self._cumulative_cost
-            if remaining_budget <= 0:
-                return RLMChatCompletion(
-                    root_model=resolved_model,
-                    prompt=prompt,
-                    response=(
-                        "Error: Budget exhausted "
-                        f"(spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f})"
-                    ),
-                    usage_summary=UsageSummary(model_usage_summaries={}),
-                    execution_time=0.0,
-                )
+            return _PreparedChild(
+                execute_child=execute_leaf,
+                usage_source=lambda: (
+                    latest_usage if latest_usage is not None else client.get_usage_summary()
+                ),
+                teardown_child=lambda: None,
+            )
 
-        # Calculate remaining timeout for child (if timeout tracking enabled)
         remaining_timeout = None
         if self.max_timeout is not None and self._completion_start_time is not None:
             elapsed = time.perf_counter() - self._completion_start_time
             remaining_timeout = self.max_timeout - elapsed
             if remaining_timeout <= 0:
-                return RLMChatCompletion(
-                    root_model=resolved_model,
-                    prompt=prompt,
-                    response=f"Error: Timeout exhausted ({elapsed:.1f}s of {self.max_timeout:.1f}s)",
-                    usage_summary=UsageSummary(model_usage_summaries={}),
-                    execution_time=0.0,
+                message = f"Timeout exhausted ({elapsed:.1f}s of {self.max_timeout:.1f}s)"
+                return self._completed_child(
+                    RLMChatCompletion(
+                        root_model=resolved_model,
+                        prompt=prompt,
+                        response=f"Error: {message}",
+                        usage_summary=UsageSummary.empty(),
+                        execution_time=0.0,
+                        error=message,
+                    )
                 )
 
-        # Resolve the model name for callbacks
         prompt_preview = prompt[:80] if len(prompt) > 80 else prompt
-
-        # Fire subcall start callback
         if self.on_subcall_start:
             try:
                 self.on_subcall_start(next_depth, str(resolved_model), prompt_preview)
             except Exception:
-                pass  # Don't let callback errors break execution
+                pass
 
         subcall_start = time.perf_counter()
         error_msg: str | None = None
-
-        # Spawn a child RLM with its own LocalREPL
+        latest_completion: RLMChatCompletion | None = None
         child = RLM(
             backend=self.backend,
             backend_kwargs=child_backend_kwargs,
@@ -819,98 +907,117 @@ class RLM:
             depth=next_depth,
             max_depth=self.max_depth,
             max_iterations=self.max_iterations,
-            max_budget=remaining_budget,
+            max_budget=child_budget,
             max_timeout=remaining_timeout,
             max_tokens=self.max_tokens,
             max_errors=self.max_errors,
             custom_system_prompt=self.system_prompt,
             other_backends=self.other_backends,
             other_backend_kwargs=self.other_backend_kwargs,
-            # Give child its own logger so its trajectory is captured in metadata
             logger=RLMLogger() if self.logger else None,
             verbose=False,
-            # Propagate custom tools to children (sub_tools become the child's tools)
             custom_tools=self.custom_sub_tools,
             custom_sub_tools=self.custom_sub_tools,
-            # Propagate concurrency settings to children
             max_concurrent_subcalls=self.max_concurrent_subcalls,
-            # Propagate callbacks to children for nested tracking
             on_subcall_start=self.on_subcall_start,
             on_subcall_complete=self.on_subcall_complete,
+            on_iteration_start=self.on_iteration_start,
+            on_iteration_complete=self.on_iteration_complete,
         )
-        try:
-            result = child.completion(prompt, root_prompt=None)
-            # Track child's cost in parent's cumulative cost
-            if result.usage_summary and result.usage_summary.total_cost:
-                self._cumulative_cost += result.usage_summary.total_cost
-            return result
-        except BudgetExceededError as e:
-            # Propagate child's spending to parent
-            self._cumulative_cost += e.spent
-            error_msg = f"Budget exceeded - {e}"
-            return RLMChatCompletion(
+
+        def execute_recursive(_cancel: Cancellation) -> RLMChatCompletion:
+            nonlocal error_msg, latest_completion
+            try:
+                latest_completion = child.completion(prompt, root_prompt=None)
+                return latest_completion
+            except BudgetExceededError as error:
+                error_msg = f"Child RLM budget exceeded - {error}"
+            except Exception as error:
+                error_msg = f"Child RLM completion failed - {error}"
+            assert error_msg is not None
+            latest_completion = RLMChatCompletion(
                 root_model=resolved_model,
                 prompt=prompt,
-                response=f"Error: Child RLM budget exceeded - {e}",
-                usage_summary=UsageSummary(model_usage_summaries={}),
+                response=f"Error: {error_msg}",
+                usage_summary=child._usage_ledger.summary(),
                 execution_time=time.perf_counter() - subcall_start,
+                error=error_msg,
             )
-        except Exception as e:
-            error_msg = str(e)
-            return RLMChatCompletion(
-                root_model=resolved_model,
-                prompt=prompt,
-                response=f"Error: Child RLM completion failed - {e}",
-                usage_summary=UsageSummary(model_usage_summaries={}),
-                execution_time=time.perf_counter() - subcall_start,
-            )
-        finally:
-            # Ensure child resources are cleaned up
-            child.close()
-            # Fire subcall complete callback
-            if self.on_subcall_complete:
-                try:
-                    duration = time.perf_counter() - subcall_start
-                    self.on_subcall_complete(next_depth, str(resolved_model), duration, error_msg)
-                except Exception:
-                    pass  # Don't let callback errors break execution
+            return latest_completion
 
-    def _validate_persistent_environment_support(self) -> None:
-        """
-        Validate that the configured environment type supports persistent mode.
+        def recursive_usage() -> UsageSummary:
+            if latest_completion is not None:
+                return latest_completion.usage_summary
+            return child._usage_ledger.summary()
 
-        Persistent mode requires environments to implement:
-        - update_handler_address(address): Update LM handler address between calls
-        - add_context(payload, index): Add new context for multi-turn conversations
-        - get_context_count(): Return the number of loaded contexts
+        def teardown_recursive() -> None:
+            try:
+                child.close()
+            finally:
+                if self.on_subcall_complete:
+                    try:
+                        duration = time.perf_counter() - subcall_start
+                        self.on_subcall_complete(
+                            next_depth,
+                            str(resolved_model),
+                            duration,
+                            error_msg,
+                        )
+                    except Exception:
+                        pass
 
-        Currently 'local', 'ipython', and 'docker' support these methods.
+        return _PreparedChild(
+            execute_child=execute_recursive,
+            usage_source=recursive_usage,
+            teardown_child=teardown_recursive,
+        )
 
-        Raises:
-            ValueError: If the environment type does not support persistent mode.
-        """
-        # Known environments that support persistence
-        persistent_supported_environments = {"local", "ipython", "docker"}
+    def _validate_environment_capabilities(self) -> None:
+        capabilities = self._environment_capabilities
+        requested = (
+            (self.persistent, capabilities.persistence, "persistent=True"),
+            (self.compaction, capabilities.compaction, "compaction=True"),
+            (self.custom_tools is not None, capabilities.custom_tools, "custom_tools"),
+        )
+        for enabled, supported, option in requested:
+            if enabled and not supported:
+                raise ValueError(
+                    f"{option} is not supported for environment type {self.environment_type!r}"
+                )
 
-        if self.environment_type not in persistent_supported_environments:
-            raise ValueError(
-                f"persistent=True is not supported for environment type '{self.environment_type}'. "
-                f"Persistent mode requires environments that implement update_handler_address(), "
-                f"add_context(), and get_context_count(). "
-                f"Supported environments: {sorted(persistent_supported_environments)}"
-            )
-
-    @staticmethod
-    def _env_supports_persistence(env: BaseEnv) -> bool:
-        """Check if an environment instance supports persistent mode methods."""
-        return isinstance(env, SupportsPersistence)
+    def _validate_environment_instance(self, environment: BaseEnv) -> None:
+        required = (
+            (self.persistent, SupportsPersistence, "persistence"),
+            (self.compaction, SupportsCompaction, "compaction"),
+            (self.custom_tools is not None, SupportsCustomTools, "custom tools"),
+        )
+        for enabled, protocol, capability in required:
+            if enabled and not isinstance(environment, protocol):
+                raise RuntimeError(
+                    f"Environment {type(environment).__name__} declares {capability} support "
+                    "but does not implement its interface"
+                )
 
     def close(self) -> None:
-        """Clean up persistent environment. Call when done with multi-turn conversations."""
+        """Clean up persistent environment and child-execution resources."""
+        errors: list[BaseException] = []
         if self._persistent_env is not None:
-            if hasattr(self._persistent_env, "cleanup"):
+            try:
                 self._persistent_env.cleanup()
-            self._persistent_env = None
+            except BaseException as error:
+                errors.append(error)
+            else:
+                self._persistent_env = None
+        try:
+            self._child_execution.close()
+        except BaseException as error:
+            errors.append(error)
+
+        if len(errors) == 1:
+            error = errors[0]
+            raise error.with_traceback(error.__traceback__)
+        if errors:
+            raise BaseExceptionGroup("RLM cleanup failed", errors)
 
     def __enter__(self) -> "RLM":
         return self

@@ -5,7 +5,7 @@ from typing import Any
 import openai
 from dotenv import load_dotenv
 
-from rlm.clients.base_lm import BaseLM
+from rlm.clients.base_lm import DEFAULT_TIMEOUT, BaseLM
 from rlm.core.types import ModelUsageSummary, UsageSummary
 
 load_dotenv()
@@ -26,9 +26,13 @@ class AzureOpenAIClient(BaseLM):
         azure_endpoint: str | None = None,
         api_version: str | None = None,
         azure_deployment: str | None = None,
-        **kwargs,
+        timeout: float = DEFAULT_TIMEOUT,
+        sampling_args: dict[str, Any] | None = None,
     ):
-        super().__init__(model_name=model_name, **kwargs)
+        super().__init__(model_name=model_name, timeout=timeout, sampling_args=sampling_args)
+        reserved = self.sampling_args.keys() & {"model", "messages"}
+        if reserved:
+            raise ValueError(f"Azure OpenAI sampling_args cannot override {sorted(reserved)}")
 
         if api_key is None:
             api_key = DEFAULT_AZURE_OPENAI_API_KEY
@@ -69,7 +73,6 @@ class AzureOpenAIClient(BaseLM):
         self.model_call_counts: dict[str, int] = defaultdict(int)
         self.model_input_tokens: dict[str, int] = defaultdict(int)
         self.model_output_tokens: dict[str, int] = defaultdict(int)
-        self.model_total_tokens: dict[str, int] = defaultdict(int)
 
     def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
         if isinstance(prompt, str):
@@ -86,6 +89,7 @@ class AzureOpenAIClient(BaseLM):
         response = self.client.chat.completions.create(
             model=model,
             messages=messages,
+            **self.sampling_args,
         )
         self._track_cost(response, model)
         return response.choices[0].message.content
@@ -107,6 +111,7 @@ class AzureOpenAIClient(BaseLM):
         response = await self.async_client.chat.completions.create(
             model=model,
             messages=messages,
+            **self.sampling_args,
         )
         self._track_cost(response, model)
         return response.choices[0].message.content
@@ -120,7 +125,6 @@ class AzureOpenAIClient(BaseLM):
 
         self.model_input_tokens[model] += usage.prompt_tokens
         self.model_output_tokens[model] += usage.completion_tokens
-        self.model_total_tokens[model] += usage.total_tokens
 
         # Track last call for handler to read
         self.last_prompt_tokens = usage.prompt_tokens

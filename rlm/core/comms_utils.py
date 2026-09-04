@@ -30,10 +30,25 @@ class LMRequest:
     model: str | None = None
     depth: int = 0
 
+    def __post_init__(self) -> None:
+        if (self.prompt is None) == (self.prompts is None):
+            raise ValueError("LM request must contain exactly one of prompt or prompts")
+        if self.prompt is not None and not isinstance(self.prompt, (str, dict)):
+            raise TypeError("LM request prompt must be a string or object")
+        if self.prompts is not None:
+            if not self.prompts:
+                raise ValueError("LM request prompts must not be empty")
+            if any(not isinstance(prompt, (str, dict)) for prompt in self.prompts):
+                raise TypeError("LM request prompts must contain strings or objects")
+        if self.model is not None and not isinstance(self.model, str):
+            raise TypeError("LM request model must be a string or None")
+        if type(self.depth) is not int or self.depth < 0:
+            raise TypeError("LM request depth must be a non-negative integer")
+
     @property
     def is_batched(self) -> bool:
         """Check if this is a batched request."""
-        return self.prompts is not None and len(self.prompts) > 0
+        return self.prompts is not None
 
     def to_dict(self) -> dict:
         """Convert to dict, excluding None values."""
@@ -49,12 +64,16 @@ class LMRequest:
 
     @classmethod
     def from_dict(cls, data: dict) -> "LMRequest":
-        """Create from dict."""
+        """Decode and validate a request received from the socket."""
+        if not isinstance(data, dict) or "depth" not in data:
+            raise TypeError("LM request is missing depth")
+        if set(data) - {"prompt", "prompts", "model", "depth"}:
+            raise TypeError("LM request has invalid fields")
         return cls(
             prompt=data.get("prompt"),
             prompts=data.get("prompts"),
             model=data.get("model"),
-            depth=data.get("depth", -1),  # TODO: Default should throw an error
+            depth=data["depth"],
         )
 
 
@@ -80,7 +99,12 @@ class LMResponse:
         return self.chat_completions is not None
 
     def to_dict(self) -> dict:
-        """Convert to dict, excluding None values."""
+        """Encode exactly one response variant."""
+        variants = sum(
+            value is not None for value in (self.error, self.chat_completion, self.chat_completions)
+        )
+        if variants != 1:
+            raise ValueError("LM response must contain exactly one response variant")
         if self.error is not None:
             return {
                 "error": self.error,
@@ -93,34 +117,34 @@ class LMResponse:
                 "chat_completion": None,
                 "error": None,
             }
-        if self.chat_completion is not None:
-            return {
-                "chat_completion": self.chat_completion.to_dict(),
-                "chat_completions": None,
-                "error": None,
-            }
+        assert self.chat_completion is not None
         return {
-            "error": "No chat completion or error provided.",
-            "chat_completion": None,
+            "chat_completion": self.chat_completion.to_dict(),
             "chat_completions": None,
+            "error": None,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "LMResponse":
-        """Create from dict."""
-        chat_completions = None
-        if data.get("chat_completions"):
-            chat_completions = [RLMChatCompletion.from_dict(c) for c in data["chat_completions"]]
-
-        chat_completion = None
-        if data.get("chat_completion"):
-            chat_completion = RLMChatCompletion.from_dict(data["chat_completion"])
-
-        return cls(
-            error=data.get("error"),
-            chat_completion=chat_completion,
-            chat_completions=chat_completions,
-        )
+        """Decode and validate exactly one socket response variant."""
+        fields = {"error", "chat_completion", "chat_completions"}
+        if not isinstance(data, dict) or set(data) != fields:
+            raise TypeError("LM response has invalid fields")
+        variants = [data[field] is not None for field in fields]
+        if sum(variants) != 1:
+            raise ValueError("LM response must contain exactly one response variant")
+        error = data["error"]
+        if error is not None:
+            if not isinstance(error, str) or not error:
+                raise TypeError("LM response error must be a non-empty string")
+            return cls(error=error)
+        completion = data["chat_completion"]
+        if completion is not None:
+            return cls(chat_completion=RLMChatCompletion.from_dict(completion))
+        completions = data["chat_completions"]
+        if not isinstance(completions, list):
+            raise TypeError("LM response chat_completions must be a list")
+        return cls(chat_completions=[RLMChatCompletion.from_dict(item) for item in completions])
 
     @classmethod
     def success_response(cls, chat_completion: RLMChatCompletion) -> "LMResponse":
@@ -258,7 +282,10 @@ def send_lm_request_batched(
         # Convert batched response to list of individual responses. A completion
         # carrying an error means only that prompt failed; the rest still succeed.
         return [
-            LMResponse.error_response(chat_completion.error)
+            LMResponse(
+                error=chat_completion.error,
+                chat_completion=chat_completion,
+            )
             if chat_completion.error
             else LMResponse.success_response(chat_completion)
             for chat_completion in response.chat_completions

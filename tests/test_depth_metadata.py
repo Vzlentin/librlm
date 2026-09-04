@@ -10,7 +10,14 @@ import pytest
 
 import rlm.core.rlm as rlm_module
 from rlm import RLM
-from rlm.core.types import ModelUsageSummary, UsageSummary
+from rlm.core.types import (
+    FinalValue,
+    ModelUsageSummary,
+    REPLResult,
+    RLMChatCompletion,
+    UsageSummary,
+)
+from rlm.environments.base_env import CompletionFinalization
 from rlm.logger import RLMLogger
 from rlm.utils.exceptions import (
     BudgetExceededError,
@@ -32,7 +39,9 @@ def create_mock_lm(responses: list[str], model_name: str = "mock-model") -> Mock
             )
         }
     )
-    mock.get_last_usage.return_value = mock.get_usage_summary.return_value
+    mock.get_last_usage.return_value = mock.get_usage_summary.return_value.model_usage_summaries[
+        model_name
+    ]
     return mock
 
 
@@ -64,6 +73,44 @@ class TestDepth1CompletionLoop:
             assert result.response == "42"
             assert result.root_model == "test-model"
 
+    def test_explicit_null_final_terminates_and_is_logged_as_present(self):
+        class NullFinalEnvironment:
+            def execute_code(self, code: str) -> REPLResult:
+                return REPLResult(
+                    stdout="",
+                    stderr="",
+                    locals={},
+                    final=FinalValue.of(None),
+                )
+
+            def finalize_completion(self) -> CompletionFinalization:
+                return CompletionFinalization()
+
+            def cleanup(self) -> None:
+                pass
+
+        with (
+            patch.object(rlm_module, "get_client") as mock_get_client,
+            patch.object(rlm_module, "get_environment", return_value=NullFinalEnvironment()),
+        ):
+            mock_get_client.return_value = create_mock_lm(["```repl\npass\n```"])
+            logger = RLMLogger()
+            rlm = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "test-model"},
+                max_depth=1,
+                logger=logger,
+            )
+
+            result = rlm.completion("Return null")
+
+        assert result.response == "null"
+        assert result.final == FinalValue.of(None)
+        assert result.metadata is not None
+        logged = result.metadata["iterations"][0]
+        assert logged["final"] == FinalValue.of(None).to_dict()
+        assert logged["final"] != FinalValue.absent().to_dict()
+
     def test_multi_iteration_before_final(self):
         """depth=1 should iterate multiple times before the model signals ready."""
         with patch.object(rlm_module, "get_client") as mock_get_client:
@@ -83,6 +130,42 @@ class TestDepth1CompletionLoop:
             )
             result = rlm.completion("Compute 2*2")
             assert result.response == "4"
+
+    def test_iteration_callbacks_wrap_each_model_turn(self):
+        events: list[tuple[str, int, int, float | None]] = []
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_get_client.return_value = create_mock_lm(
+                [
+                    "```repl\nprint('thinking')\n```",
+                    final("done"),
+                ]
+            )
+            rlm = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "test-model"},
+                max_depth=1,
+                on_iteration_start=lambda depth, iteration: events.append(
+                    ("start", depth, iteration, None)
+                ),
+                on_iteration_complete=lambda depth, iteration, duration: events.append(
+                    ("complete", depth, iteration, duration)
+                ),
+            )
+
+            result = rlm.completion("test")
+
+        assert result.response == "done"
+        assert [(kind, depth, iteration) for kind, depth, iteration, _ in events] == [
+            ("start", 0, 1),
+            ("complete", 0, 1),
+            ("start", 0, 2),
+            ("complete", 0, 2),
+        ]
+        assert all(
+            duration is not None and duration >= 0
+            for kind, _, _, duration in events
+            if kind == "complete"
+        )
 
     def test_no_subcall_fn_at_depth_1(self):
         """depth=1 (max_depth=1) should NOT pass subcall_fn to environment."""
@@ -201,6 +284,7 @@ class TestDepth1LimitChecks:
                 )
             }
         )
+        rlm._usage_ledger.bind_root(mock_handler.get_usage_summary)
 
         error_result = REPLResult(stdout="", stderr="SyntaxError: bad", locals={}, rlm_calls=[])
         error_iteration = RLMIteration(
@@ -208,12 +292,12 @@ class TestDepth1LimitChecks:
         )
 
         # First error
-        rlm._check_iteration_limits(error_iteration, 0, mock_handler)
+        rlm._check_iteration_limits(error_iteration, 0)
         assert rlm._consecutive_errors == 1
 
         # Second error should raise
         with pytest.raises(ErrorThresholdExceededError) as exc_info:
-            rlm._check_iteration_limits(error_iteration, 1, mock_handler)
+            rlm._check_iteration_limits(error_iteration, 1)
         assert exc_info.value.error_count == 2
         assert exc_info.value.threshold == 2
 
@@ -235,6 +319,7 @@ class TestDepth1LimitChecks:
                 )
             }
         )
+        rlm._usage_ledger.bind_root(mock_handler.get_usage_summary)
 
         error_result = REPLResult(stdout="", stderr="Error!", locals={}, rlm_calls=[])
         error_iter = RLMIteration(
@@ -247,12 +332,12 @@ class TestDepth1LimitChecks:
         )
 
         # Two errors
-        rlm._check_iteration_limits(error_iter, 0, mock_handler)
-        rlm._check_iteration_limits(error_iter, 1, mock_handler)
+        rlm._check_iteration_limits(error_iter, 0)
+        rlm._check_iteration_limits(error_iter, 1)
         assert rlm._consecutive_errors == 2
 
         # Success resets
-        rlm._check_iteration_limits(ok_iter, 2, mock_handler)
+        rlm._check_iteration_limits(ok_iter, 2)
         assert rlm._consecutive_errors == 0
 
     def test_budget_check_raises(self):
@@ -278,9 +363,10 @@ class TestDepth1LimitChecks:
         )
 
         iteration = RLMIteration(prompt="test", response="code", code_blocks=[])
+        rlm._usage_ledger.bind_root(mock_handler.get_usage_summary)
 
         with pytest.raises(BudgetExceededError) as exc_info:
-            rlm._check_iteration_limits(iteration, 0, mock_handler)
+            rlm._check_iteration_limits(iteration, 0)
         assert exc_info.value.spent > 0.01
         assert exc_info.value.budget == 0.01
 
@@ -306,9 +392,10 @@ class TestDepth1LimitChecks:
         )
 
         iteration = RLMIteration(prompt="test", response="code", code_blocks=[])
+        rlm._usage_ledger.bind_root(mock_handler.get_usage_summary)
 
         with pytest.raises(TokenLimitExceededError) as exc_info:
-            rlm._check_iteration_limits(iteration, 0, mock_handler)
+            rlm._check_iteration_limits(iteration, 0)
         assert exc_info.value.tokens_used == 160
         assert exc_info.value.token_limit == 100
 
@@ -381,6 +468,81 @@ class TestDepth1LoggerMetadata:
 # ========================================================================
 
 
+class TestAsyncUsageLedger:
+    @staticmethod
+    def root_client() -> Mock:
+        client = Mock()
+        client.model_name = "root"
+        client.completion.return_value = (
+            "```repl\n"
+            "h = await rlm.spawn('custom')\n"
+            "value = (await rlm.gather([h]))[0]\n"
+            "await rlm.final(value['text'])\n"
+            "```"
+        )
+        client.get_usage_summary.return_value = UsageSummary(
+            model_usage_summaries={"root": ModelUsageSummary(1, 10, 5, total_cost=0.1)}
+        )
+        return client
+
+    @staticmethod
+    def child_runner(_request, _cancel) -> RLMChatCompletion:
+        usage = UsageSummary(
+            model_usage_summaries={"custom-child": ModelUsageSummary(1, 3, 2, total_cost=0.2)}
+        )
+        completion = RLMChatCompletion(
+            root_model="custom-child",
+            prompt="custom",
+            response="custom-result",
+            usage_summary=usage,
+            execution_time=0.001,
+        )
+        return completion
+
+    def test_returned_usage_includes_custom_async_runner_once(self):
+        with patch.object(rlm_module, "get_client", return_value=self.root_client()):
+            result = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "root"},
+                environment="ipython",
+                environment_kwargs={
+                    "kernel_mode": "subprocess",
+                    "async_child_runner": self.child_runner,
+                },
+                max_depth=1,
+            ).completion("prompt")
+
+        assert result.response == "custom-result"
+        assert result.usage_summary.total_cost == pytest.approx(0.3)
+        assert result.usage_summary.total_input_tokens == 13
+        assert result.usage_summary.total_output_tokens == 7
+
+    def test_budget_check_uses_same_root_and_custom_child_ledger(self):
+        with patch.object(rlm_module, "get_client", return_value=self.root_client()):
+            rlm = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "root"},
+                environment="ipython",
+                environment_kwargs={
+                    "kernel_mode": "subprocess",
+                    "async_child_runner": self.child_runner,
+                },
+                max_depth=1,
+                max_budget=0.25,
+                persistent=True,
+            )
+            try:
+                with pytest.raises(BudgetExceededError) as failure:
+                    rlm.completion("prompt")
+                assert rlm._persistent_env is not None
+                assert rlm._persistent_env.get_history_count() == 0
+            finally:
+                rlm.close()
+
+        assert failure.value.spent == pytest.approx(0.3)
+        assert failure.value.budget == 0.25
+
+
 class TestSubcallLoggerPropagation:
     """Verify child RLM gets a logger when parent has one, and metadata flows back."""
 
@@ -408,7 +570,7 @@ class TestSubcallLoggerPropagation:
             )
 
             with patch.object(rlm_module, "RLM", CapturingRLM):
-                parent._subcall("test prompt")
+                parent.subcall("test prompt")
 
             # Child should have received a logger
             child_logger = captured_child_params.get("logger")
@@ -442,7 +604,7 @@ class TestSubcallLoggerPropagation:
             )
 
             with patch.object(rlm_module, "RLM", CapturingRLM):
-                parent._subcall("test prompt")
+                parent.subcall("test prompt")
 
             assert captured_child_params.get("logger") is None
 
@@ -462,7 +624,7 @@ class TestSubcallLoggerPropagation:
                 logger=RLMLogger(),
             )
 
-            result = parent._subcall("test prompt")
+            result = parent.subcall("test prompt")
 
             # Leaf completions don't use RLM, so no metadata
             assert result.metadata is None
@@ -485,7 +647,7 @@ class TestSubcallLoggerPropagation:
                 logger=RLMLogger(),
             )
 
-            result = parent._subcall("What is 2+2?")
+            result = parent.subcall("What is 2+2?")
 
             # Child should have returned metadata with trajectory
             assert result.metadata is not None
@@ -497,7 +659,7 @@ class TestSubcallLoggerPropagation:
 
 
 class TestSubcallCustomToolsPropagation:
-    """Verify custom_tools propagation to child RLM in _subcall."""
+    """Verify custom_tools propagation to child RLM in subcall."""
 
     def test_sub_tools_propagated_to_child(self):
         """Child should receive parent's custom_sub_tools as its custom_tools."""
@@ -524,7 +686,7 @@ class TestSubcallCustomToolsPropagation:
             )
 
             with patch.object(rlm_module, "RLM", CapturingRLM):
-                parent._subcall("test prompt")
+                parent.subcall("test prompt")
 
             assert "double" in captured_child_params.get("custom_tools", {})
             assert "double" in captured_child_params.get("custom_sub_tools", {})
@@ -555,7 +717,7 @@ class TestSubcallCustomToolsPropagation:
             )
 
             with patch.object(rlm_module, "RLM", CapturingRLM):
-                parent._subcall("test prompt")
+                parent.subcall("test prompt")
 
             assert captured_child_params.get("custom_tools") == {}
             assert captured_child_params.get("custom_sub_tools") == {}

@@ -3,7 +3,7 @@ from typing import Any
 
 import anthropic
 
-from rlm.clients.base_lm import BaseLM
+from rlm.clients.base_lm import DEFAULT_TIMEOUT, BaseLM
 from rlm.core.types import ModelUsageSummary, UsageSummary
 
 
@@ -17,9 +17,13 @@ class AnthropicClient(BaseLM):
         api_key: str,
         model_name: str | None = None,
         max_tokens: int = 32768,
-        **kwargs,
+        timeout: float = DEFAULT_TIMEOUT,
+        sampling_args: dict[str, Any] | None = None,
     ):
-        super().__init__(model_name=model_name, **kwargs)
+        super().__init__(model_name=model_name, timeout=timeout, sampling_args=sampling_args)
+        reserved = self.sampling_args.keys() & {"model", "messages", "system"}
+        if reserved:
+            raise ValueError(f"Anthropic sampling_args cannot override {sorted(reserved)}")
         self.client = anthropic.Anthropic(api_key=api_key, timeout=self.timeout)
         self.async_client = anthropic.AsyncAnthropic(api_key=api_key, timeout=self.timeout)
         self.model_name = model_name
@@ -29,7 +33,6 @@ class AnthropicClient(BaseLM):
         self.model_call_counts: dict[str, int] = defaultdict(int)
         self.model_input_tokens: dict[str, int] = defaultdict(int)
         self.model_output_tokens: dict[str, int] = defaultdict(int)
-        self.model_total_tokens: dict[str, int] = defaultdict(int)
 
     def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
         messages, system = self._prepare_messages(prompt)
@@ -38,7 +41,12 @@ class AnthropicClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Anthropic client.")
 
-        kwargs = {"model": model, "max_tokens": self.max_tokens, "messages": messages}
+        kwargs = {
+            "model": model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+            **self.sampling_args,
+        }
         if system:
             kwargs["system"] = system
 
@@ -55,7 +63,12 @@ class AnthropicClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Anthropic client.")
 
-        kwargs = {"model": model, "max_tokens": self.max_tokens, "messages": messages}
+        kwargs = {
+            "model": model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+            **self.sampling_args,
+        }
         if system:
             kwargs["system"] = system
 
@@ -88,7 +101,6 @@ class AnthropicClient(BaseLM):
         self.model_call_counts[model] += 1
         self.model_input_tokens[model] += response.usage.input_tokens
         self.model_output_tokens[model] += response.usage.output_tokens
-        self.model_total_tokens[model] += response.usage.input_tokens + response.usage.output_tokens
 
         # Track last call for handler to read
         self.last_prompt_tokens = response.usage.input_tokens
