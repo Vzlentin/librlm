@@ -257,6 +257,19 @@ async def test_empty_gather_short_circuits_without_host_recovery_state() -> None
 
 
 @pytest.mark.asyncio
+async def test_gather_rejects_unawaited_spawn_with_clear_message() -> None:
+    with running_host(lambda request, cancel: result("unused"), max_live_handles=1) as host:
+        host.begin_execution("cell")
+        client = RLMClient(host.address, host.auth_token)
+        activate(client, "cell")
+        pending = client.spawn("task")
+        with pytest.raises(TypeError, match="await rlm.spawn"):
+            await client.gather([pending])
+        pending.close()
+        host.end_execution("cell", successful=True)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_local_gathers_have_one_winner_and_one_usage() -> None:
     gate = threading.Event()
 

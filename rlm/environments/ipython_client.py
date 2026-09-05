@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import inspect
 import os
 import secrets
 import threading
@@ -458,6 +459,10 @@ class RLMClient:
         except TypeError as error:
             raise TypeError(f"rlm.{operation} requires an iterable of rlm handles") from error
         for handle in items:
+            if inspect.iscoroutine(handle):
+                raise TypeError(
+                    f"rlm.{operation} received a coroutine; use h = await rlm.spawn(...) first"
+                )
             if not isinstance(handle, RLMHandle) or handle._client is not self:
                 raise TypeError(f"rlm.{operation} received a handle from another RLM client")
         return items
