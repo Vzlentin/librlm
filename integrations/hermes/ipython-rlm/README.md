@@ -1,6 +1,6 @@
 # Hermes IPython/RLM plugin
 
-Native Hermes consumer of the standalone librlm Jupyter bridge. Tool descriptions load `rlm/prompts/ipython.json`. The personal shared Pi/Hermes `rlm` skill lives directly in `~/.agents/skills/rlm`. Both harnesses discover that directory; no skill links or prompt aliases are needed. The skill is user configuration rather than part of this plugin's source package.
+Native Hermes consumer of the standalone librlm Jupyter bridge, whose kernel loads `rlm.ipython_extension`. Tool descriptions load `rlm/prompts/ipython.json`. The personal shared Pi/Hermes `rlm` skill lives directly in `~/.agents/skills/rlm`. Both harnesses discover that directory; no skill links or prompt aliases are needed. The skill is user configuration rather than part of this plugin's source package.
 
 ## Installation
 

@@ -2,21 +2,27 @@
 
 This checkout is the shared librlm runtime for Pi and Hermes. It was extracted
 from the Pi subtree at `41187970d0a7bebcaeb2db403fd2f6c3e061a11f`, retaining its
-history. Core Python modules, the Jupyter bridge (`rlm/bridge.py`), and shared
-instructions (`rlm/prompts/ipython.json`) live here.
+history. Core Python modules, the in-kernel IPython extension
+(`rlm/ipython_extension.py`), the Hermes Jupyter bridge (`rlm/bridge.py`), and
+shared instructions (`rlm/prompts/ipython.json`) live here.
 
 ```sh
 uv sync --python 3.12 --extra ipython --group dev --group test
 ```
 
-Pi's separate extension checkout uses this sibling directory by default, or
-`RLM_LIBRLM_ROOT`. Its lightweight Python 3.12 runtime remains extension-owned.
-The Hermes adapter and installation steps are in
-[integrations/hermes/ipython-rlm](integrations/hermes/ipython-rlm/README.md).
-Both consumers use the same persistent kernel bridge and async primitive API;
-the direct `RLM(...)` completion API remains available.
+Both harnesses load the same extension in their kernel with
+`%load_ext rlm.ipython_extension`. It hosts child handles inside the kernel,
+binds `rlm`, and forwards each child completion to the harness socket named by
+`RLM_HOST_SOCKET` and `RLM_HOST_TOKEN`.
 
-The shared prompt separates the fixed API contract from harness guidance.
+- Pi: the [pi-rlm](https://github.com/Vzlentin/pi-rlm) package, on top of
+  [pi-ipython](https://github.com/Vzlentin/pi-ipython), follows this repository's
+  `main` in a managed clone, or uses `RLM_LIBRLM_ROOT`.
+- Hermes: the adapter in
+  [integrations/hermes/ipython-rlm](integrations/hermes/ipython-rlm/README.md)
+  runs `rlm/bridge.py` with this checkout's `.venv`.
+
+The direct `RLM(...)` completion API remains available.
 
 See the [shared runtime architecture](docs/unification.md).
 
