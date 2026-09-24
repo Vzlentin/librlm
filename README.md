@@ -1,3 +1,24 @@
+## Local harness integration
+
+This checkout is the shared librlm runtime for Pi and Hermes. It was extracted
+from the Pi subtree at `41187970d0a7bebcaeb2db403fd2f6c3e061a11f`, retaining its
+history. Core Python modules, the Jupyter bridge (`rlm/bridge.py`), and shared
+instructions (`rlm/prompts/ipython.json`) live here.
+
+```sh
+uv sync --python 3.12 --extra ipython --group dev --group test
+```
+
+Pi's separate extension checkout uses this sibling directory by default, or
+`RLM_LIBRLM_ROOT`. Its lightweight Python 3.12 runtime remains extension-owned.
+The Hermes adapter and installation steps are in
+[integrations/hermes/ipython-rlm](integrations/hermes/ipython-rlm/README.md).
+Both consumers use the same persistent kernel bridge and async primitive API;
+the direct `RLM(...)` completion API remains available.
+
+The shared prompt separates the fixed API contract from harness guidance.
+
+See the [shared runtime architecture](docs/unification.md).
 
 ---
 

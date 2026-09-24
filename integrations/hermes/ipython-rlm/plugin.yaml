@@ -1,0 +1,6 @@
+name: ipython-rlm
+version: "0.1.0"
+description: Persistent chat-owned IPython with opt-in bounded RLM child calls.
+author: Valentin, Hermes Agent
+provides_tools: [ipython]
+provides_hooks: [on_session_finalize, on_session_reset]

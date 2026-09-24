@@ -70,6 +70,7 @@ uv run pre-commit install
 ### Testing
 - `uv run pytest` with discovery under `tests/`
 - Write simple, deterministic unit tests
+- No tautological tests: assert observable behavior with independent inputs, not source strings, method names, or duplicated implementation constants. Use real kernels for persistence and cleanup contracts; mock only external provider boundaries.
 - Update tests when changing functionality
 - For isolated environments, mock external services
 
