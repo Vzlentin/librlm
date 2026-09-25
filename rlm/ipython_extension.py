@@ -13,6 +13,7 @@ import secrets
 import socket
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from rlm.environments.ipython_async import (
@@ -33,7 +34,8 @@ _CLIENT_KEY = "_rlm_client"
 # A harness may name the next cell's execution; otherwise the kernel generates one.
 next_execution_id: str | None = None
 last_summary = ExecutionSummary()
-_released: list[str] = []
+# Drained by harnesses that read execution_report(); bounded for those that never do.
+_released: deque[str] = deque(maxlen=1024)
 _extension: _Extension | None = None
 
 
@@ -138,7 +140,7 @@ def request_host_child(request: ChildRequest, cancel: threading.Event) -> ChildO
 
 def execution_report() -> str:
     """Return the last cell's summary and execution ids released since the last report."""
-    released = [_released.pop(0) for _ in range(len(_released))]
+    released = [_released.popleft() for _ in range(len(_released))]
     return json.dumps(
         {"host": last_summary.to_wire(), "released": released},
         ensure_ascii=False,
