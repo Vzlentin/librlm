@@ -25,7 +25,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv pip install --system -e .
+          uv pip install --system -e ".[ipython]"
           uv pip install --system pytest pytest-asyncio pytest-cov
 
       - name: Run tests
