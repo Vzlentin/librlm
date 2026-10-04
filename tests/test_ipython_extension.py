@@ -9,13 +9,18 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 
 import pytest
 
 jupyter_client = pytest.importorskip("jupyter_client")
 
+import rlm.ipython_extension as host_extension  # noqa: E402
+from rlm.core.child_execution import ChildRequest  # noqa: E402
 from rlm.ipython_extension import empty_child_usage, request_host_child  # noqa: E402
+from rlm.prompts import load_ipython_prompt  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 TOKEN = "fixture-token"
@@ -137,6 +142,77 @@ def test_failed_cell_cancels_its_children(kernel):
     assert harness.disconnected == ["block me"]
     reply, output = run(client, "print('rlm' in globals())")
     assert output.strip() == "True"
+
+
+@pytest.mark.parametrize("timeout_seconds", ["1", "0.25"])
+def test_host_child_timeout_returns_error_and_closes_socket(monkeypatch, request, timeout_seconds):
+    monkeypatch.setenv("RLM_HOST_CHILD_TIMEOUT_SECONDS", timeout_seconds)
+    client, harness = request.getfixturevalue("kernel")
+    reply, output = run(
+        client,
+        "import asyncio, json, time\n"
+        "started = time.monotonic()\n"
+        "h = await rlm.spawn('block until timeout')\n"
+        "[r] = await asyncio.wait_for(rlm.gather([h]), 5)\n"
+        "print(json.dumps({'status': r.status, 'error': r.error, "
+        "'elapsed': time.monotonic() - started}))",
+    )
+    assert reply["status"] == "ok", reply
+    result = json.loads(output)
+    assert result["status"] == "error"
+    assert result["error"] == "TimeoutError: Host child completion timed out"
+    assert float(timeout_seconds) <= result["elapsed"] < 5
+    deadline = time.monotonic() + 10
+    while not harness.disconnected and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert harness.disconnected == ["block until timeout"]
+
+
+@pytest.mark.parametrize("value", ["", "not-a-number", "0", "-1", "nan", "inf", "-inf"])
+def test_invalid_host_child_timeout_becomes_typed_error(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("RLM_HOST_CHILD_TIMEOUT_SECONDS", value)
+    monkeypatch.setenv("RLM_HOST_SOCKET", str(tmp_path / "host.sock"))
+    monkeypatch.setenv("RLM_HOST_TOKEN", TOKEN)
+    outcome = request_host_child(ChildRequest(task="invalid timeout"), threading.Event())
+    assert outcome.status == "error"
+    assert outcome.error is not None
+    assert outcome.error.startswith("ValueError:")
+    assert "RLM_HOST_CHILD_TIMEOUT_SECONDS" in outcome.error
+
+
+class _ShiftedClock:
+    """A `time` stand-in whose monotonic clock runs far ahead of the real one."""
+
+    @staticmethod
+    def monotonic() -> float:
+        return time.monotonic() + 10_000
+
+
+def test_unset_host_child_timeout_waits_until_cancelled(monkeypatch) -> None:
+    harness = FakeHarness()
+    try:
+        monkeypatch.delenv("RLM_HOST_CHILD_TIMEOUT_SECONDS", raising=False)
+        monkeypatch.setenv("RLM_HOST_SOCKET", harness.path)
+        monkeypatch.setenv("RLM_HOST_TOKEN", TOKEN)
+        monkeypatch.setattr(host_extension, "time", _ShiftedClock)
+        cancel = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(request_host_child, ChildRequest(task="block forever"), cancel)
+            with pytest.raises(FuturesTimeout):
+                future.result(timeout=0.5)
+            cancel.set()
+            outcome = future.result(timeout=5)
+        assert outcome.status == "cancelled"
+        deadline = time.monotonic() + 10
+        while not harness.disconnected and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert harness.disconnected == ["block forever"]
+    finally:
+        harness.close()
+
+
+def test_shared_ipython_prompt_loads() -> None:
+    load_ipython_prompt()
 
 
 def test_named_execution_reaches_child_requests(kernel):

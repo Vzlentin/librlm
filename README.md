@@ -15,6 +15,12 @@ Both harnesses load the same extension in their kernel with
 binds `rlm`, and forwards each child completion to the harness socket named by
 `RLM_HOST_SOCKET` and `RLM_HOST_TOKEN`.
 
+`RLM_HOST_CHILD_TIMEOUT_SECONDS` sets how long the extension waits for a host child
+response, in seconds. It accepts finite positive numbers, including fractions. When
+unset, the extension waits for the host with no timeout and still stops on
+cancellation. An invalid value returns an `error` child result that names the
+variable, without opening a socket.
+
 - Pi: the [pi-rlm](https://github.com/Vzlentin/pi-rlm) package, on top of
   [pi-ipython](https://github.com/Vzlentin/pi-ipython), follows this repository's
   `main` in a managed clone, or uses `RLM_LIBRLM_ROOT`.
