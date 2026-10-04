@@ -29,7 +29,6 @@ from rlm.environments.ipython_kernel import install_kernel_runtime
 
 HOST_PROTOCOL_VERSION = 2
 _HOST_RESPONSE_LIMIT = 5 * 1024 * 1024
-_HOST_TIMEOUT_SECONDS = 310
 _CLIENT_KEY = "_rlm_client"
 
 # A harness may name the next cell's execution; otherwise the kernel generates one.
@@ -46,16 +45,17 @@ def request_host_child_transport(request: ChildRequest, cancel: threading.Event)
     auth_token = os.environ.get("RLM_HOST_TOKEN")
     if not socket_path or not auth_token:
         raise RuntimeError("RLM host socket configuration is missing")
-    try:
-        timeout_seconds = float(
-            os.environ.get("RLM_HOST_CHILD_TIMEOUT_SECONDS", _HOST_TIMEOUT_SECONDS)
-        )
-    except ValueError as error:
-        raise ValueError(
-            "RLM_HOST_CHILD_TIMEOUT_SECONDS must be a finite positive number"
-        ) from error
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise ValueError("RLM_HOST_CHILD_TIMEOUT_SECONDS must be a finite positive number")
+    timeout_seconds: float | None = None
+    raw_timeout = os.environ.get("RLM_HOST_CHILD_TIMEOUT_SECONDS")
+    if raw_timeout is not None:
+        try:
+            timeout_seconds = float(raw_timeout)
+        except ValueError as error:
+            raise ValueError(
+                "RLM_HOST_CHILD_TIMEOUT_SECONDS must be a finite positive number"
+            ) from error
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("RLM_HOST_CHILD_TIMEOUT_SECONDS must be a finite positive number")
     request_id = secrets.token_hex(16)
     payload = {
         "version": HOST_PROTOCOL_VERSION,
@@ -78,11 +78,11 @@ def request_host_child_transport(request: ChildRequest, cancel: threading.Event)
         connection.connect(socket_path)
         connection.sendall(encoded)
         response = bytearray()
-        deadline = time.monotonic() + timeout_seconds
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         while b"\n" not in response:
             if cancel.is_set():
                 raise RuntimeError("child completion cancelled")
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Host child completion timed out")
             try:
                 chunk = connection.recv(64 * 1024)
