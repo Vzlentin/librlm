@@ -8,6 +8,7 @@ execution; child completions are forwarded to the harness socket (host protocol 
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import socket
@@ -45,6 +46,16 @@ def request_host_child_transport(request: ChildRequest, cancel: threading.Event)
     auth_token = os.environ.get("RLM_HOST_TOKEN")
     if not socket_path or not auth_token:
         raise RuntimeError("RLM host socket configuration is missing")
+    try:
+        timeout_seconds = float(
+            os.environ.get("RLM_HOST_CHILD_TIMEOUT_SECONDS", _HOST_TIMEOUT_SECONDS)
+        )
+    except ValueError as error:
+        raise ValueError(
+            "RLM_HOST_CHILD_TIMEOUT_SECONDS must be a finite positive number"
+        ) from error
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("RLM_HOST_CHILD_TIMEOUT_SECONDS must be a finite positive number")
     request_id = secrets.token_hex(16)
     payload = {
         "version": HOST_PROTOCOL_VERSION,
@@ -67,7 +78,7 @@ def request_host_child_transport(request: ChildRequest, cancel: threading.Event)
         connection.connect(socket_path)
         connection.sendall(encoded)
         response = bytearray()
-        deadline = time.monotonic() + _HOST_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         while b"\n" not in response:
             if cancel.is_set():
                 raise RuntimeError("child completion cancelled")

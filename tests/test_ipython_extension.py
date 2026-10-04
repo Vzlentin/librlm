@@ -15,7 +15,9 @@ import pytest
 
 jupyter_client = pytest.importorskip("jupyter_client")
 
+from rlm.core.child_execution import ChildRequest  # noqa: E402
 from rlm.ipython_extension import empty_child_usage, request_host_child  # noqa: E402
+from rlm.prompts import load_ipython_prompt  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 TOKEN = "fixture-token"
@@ -137,6 +139,46 @@ def test_failed_cell_cancels_its_children(kernel):
     assert harness.disconnected == ["block me"]
     reply, output = run(client, "print('rlm' in globals())")
     assert output.strip() == "True"
+
+
+@pytest.mark.parametrize("timeout_seconds", ["1", "0.25"])
+def test_host_child_timeout_returns_error_and_closes_socket(monkeypatch, request, timeout_seconds):
+    monkeypatch.setenv("RLM_HOST_CHILD_TIMEOUT_SECONDS", timeout_seconds)
+    client, harness = request.getfixturevalue("kernel")
+    reply, output = run(
+        client,
+        "import asyncio, json, time\n"
+        "started = time.monotonic()\n"
+        "h = await rlm.spawn('block until timeout')\n"
+        "[r] = await asyncio.wait_for(rlm.gather([h]), 5)\n"
+        "print(json.dumps({'status': r.status, 'error': r.error, "
+        "'elapsed': time.monotonic() - started}))",
+    )
+    assert reply["status"] == "ok", reply
+    result = json.loads(output)
+    assert result["status"] == "error"
+    assert result["error"] == "TimeoutError: Host child completion timed out"
+    assert float(timeout_seconds) <= result["elapsed"] < 5
+    deadline = time.monotonic() + 10
+    while not harness.disconnected and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert harness.disconnected == ["block until timeout"]
+
+
+@pytest.mark.parametrize("value", ["", "not-a-number", "0", "-1", "nan", "inf", "-inf"])
+def test_invalid_host_child_timeout_becomes_typed_error(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("RLM_HOST_CHILD_TIMEOUT_SECONDS", value)
+    monkeypatch.setenv("RLM_HOST_SOCKET", str(tmp_path / "host.sock"))
+    monkeypatch.setenv("RLM_HOST_TOKEN", TOKEN)
+    outcome = request_host_child(ChildRequest(task="invalid timeout"), threading.Event())
+    assert outcome.status == "error"
+    assert outcome.error is not None
+    assert outcome.error.startswith("ValueError:")
+    assert "RLM_HOST_CHILD_TIMEOUT_SECONDS" in outcome.error
+
+
+def test_shared_ipython_prompt_loads() -> None:
+    load_ipython_prompt()
 
 
 def test_named_execution_reaches_child_requests(kernel):
